@@ -158,7 +158,7 @@ architectural decisions.
 | Layer | Tools |
 | --- | --- |
 | Language / runtime | Python 3 (stdlib-first), Linux, systemd |
-| Engine | Claude Code (`claude -p`, stream-json) |
+| Engine | Claude Code headless (`claude -p`, stream-json) — the **Claude Agent SDK** interface |
 | Search | `fastembed` (MiniLM, 384-dim), `sqlite-vec`, SQLite FTS5 |
 | Telegram | local Bot API server (Docker), Telethon (user session) |
 | Browser | patchright (stealth) + Chrome under Xvfb |

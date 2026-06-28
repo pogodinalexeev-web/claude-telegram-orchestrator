@@ -164,7 +164,7 @@ reciprocal-rank fusion. Прогретый демон держит модель 
 | Слой | Инструменты |
 | --- | --- |
 | Язык / среда | Python 3 (stdlib-first), Linux, systemd |
-| Движок | Claude Code (`claude -p`, stream-json) |
+| Движок | Claude Code в headless-режиме (`claude -p`, stream-json) — интерфейс **Claude Agent SDK** |
 | Поиск | `fastembed` (MiniLM, 384-dim), `sqlite-vec`, SQLite FTS5 |
 | Telegram | локальный Bot API server (Docker), Telethon (user-сессия) |
 | Браузер | patchright (стелс) + Chrome под Xvfb |
