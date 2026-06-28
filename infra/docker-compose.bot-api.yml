@@ -1,0 +1,26 @@
+# Telegram Bot API local server — allows file uploads up to 2 GB
+# (vs 50 MB on the public api.telegram.org).
+# Run with:  docker compose -f docker-compose.bot-api.yml up -d
+#
+# Required env vars (export or put in .env):
+#   TELEGRAM_API_ID    — from https://my.telegram.org/apps
+#   TELEGRAM_API_HASH  — from https://my.telegram.org/apps
+
+version: "3.9"
+
+services:
+  tg-local-api:
+    image: aiogram/telegram-bot-api:latest
+    container_name: tg-local-api
+    restart: unless-stopped
+    environment:
+      TELEGRAM_API_ID: "${TELEGRAM_API_ID}"
+      TELEGRAM_API_HASH: "${TELEGRAM_API_HASH}"
+      TELEGRAM_LOCAL: "1"           # enable local mode (up to 2 GB files)
+    ports:
+      - "127.0.0.1:8081:8081"       # bind only on loopback — not exposed externally
+    volumes:
+      - tg-bot-api-data:/var/lib/telegram-bot-api
+
+volumes:
+  tg-bot-api-data:

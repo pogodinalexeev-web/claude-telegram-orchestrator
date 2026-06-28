@@ -1,0 +1,120 @@
+#!/usr/bin/env bash
+# claude-task.sh — inject a scheduled prompt into the resident bot, post reply to TG.
+#
+# Usage: claude-task.sh <task-name> <prompt>
+#
+# Architecture:
+#   1. Pre-sync: pull vault from git remote so Claude sees latest notes.
+#   2. Inject: POST the prompt to the resident tg-bot process via its local HTTPS
+#      endpoint (/inject).  The bot runs the prompt through Claude Code as a real
+#      turn, so the reply lands in the conversation memory and is sent to TG by
+#      the bot itself — not by this script.
+#   3. Post-sync: commit any vault changes made during the turn, push to remote.
+#
+# Required files (outside git, secrets):
+#   /etc/claude-tg/token          — Telegram bot token
+#   /etc/claude-tg/shortcut-token — shared secret for the /inject endpoint (HMAC or random)
+#
+# Env vars:
+#   CLAUDE_TIMEOUT  — max seconds to wait for Claude response (default: 900)
+
+set -u
+
+TASK="${1:?task name required}"
+PROMPT="${2:?prompt required}"
+
+VAULT="<install-dir>/vault"
+TOKEN_FILE="/etc/claude-tg/token"        # Telegram bot token (one line)
+CHAT_ID="${OWNER_CHAT_ID}"               # exported from environment or set here
+LOG_DIR="${XDG_CACHE_HOME:-<install-dir>/.cache}/claude-tg/scheduled-logs"
+TG_CHUNK=4000
+
+mkdir -p "$LOG_DIR"
+LOG="$LOG_DIR/${TASK}.log"
+TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+if [ ! -r "$TOKEN_FILE" ]; then
+  echo "[$TS] [$TASK] token file not readable: $TOKEN_FILE" >> "$LOG"
+  exit 1
+fi
+TOKEN="$(cat "$TOKEN_FILE")"
+API="https://api.telegram.org/bot${TOKEN}"
+
+send_tg() {
+  local text="$1"
+  while [ -n "$text" ]; do
+    local part="${text:0:$TG_CHUNK}"
+    text="${text:$TG_CHUNK}"
+    curl -sS -X POST "$API/sendMessage" \
+      --data-urlencode "chat_id=${CHAT_ID}" \
+      --data-urlencode "text=${part}" \
+      >/dev/null || echo "[$TS] [$TASK] tg send failed" >> "$LOG"
+  done
+}
+
+echo "[$TS] [$TASK] start" >> "$LOG"
+
+# ── 1. Pre-sync: pull vault ──────────────────────────────────────────────────
+PRESYNC_ERR=""
+cd "$VAULT" || PRESYNC_ERR="cd vault failed"
+if [ -z "$PRESYNC_ERR" ]; then
+  GIT_TERMINAL_PROMPT=0 git fetch origin main >>"$LOG" 2>&1 || true
+  if ! GIT_TERMINAL_PROMPT=0 git merge --ff-only origin/main >>"$LOG" 2>&1; then
+    if ! GIT_TERMINAL_PROMPT=0 git merge --no-edit -m "auto-merge from client ($TASK $TS)" origin/main >>"$LOG" 2>&1; then
+      GIT_TERMINAL_PROMPT=0 git merge --abort >/dev/null 2>&1 || true
+      PRESYNC_ERR="vault diverged from origin/main — manual merge needed"
+    fi
+  fi
+fi
+[ -n "$PRESYNC_ERR" ] && send_tg "⚠️ [$TASK] pre-sync: $PRESYNC_ERR"
+
+# ── 2. Inject prompt into resident bot ──────────────────────────────────────
+SHORTCUT_TOKEN_FILE="/etc/claude-tg/shortcut-token"
+INJECT_URL="https://127.0.0.1:8444/inject?fmt=text"
+
+if [ ! -r "$SHORTCUT_TOKEN_FILE" ]; then
+  echo "[$TS] [$TASK] shortcut-token not readable" >> "$LOG"
+  send_tg "⚠️ [$TASK] no shortcut-token — cannot inject into resident"
+  exit 1
+fi
+STOKEN="$(cat "$SHORTCUT_TOKEN_FILE")"
+REQ_BODY="$(python3 -c 'import json,sys; print(json.dumps({"text": sys.argv[1]}))' "$PROMPT")"
+
+HTTP_CODE="$(curl -sS -k -o "$LOG_DIR/${TASK}.resp" -w '%{http_code}' \
+  --max-time "${CLAUDE_TIMEOUT:-900}" \
+  -X POST "$INJECT_URL" \
+  -H "X-Auth-Token: ${STOKEN}" \
+  -H "Content-Type: application/json" \
+  --data-binary "$REQ_BODY" 2>>"$LOG")" || HTTP_CODE="000"
+
+if [ "$HTTP_CODE" != "200" ]; then
+  echo "[$TS] [$TASK] inject failed http=$HTTP_CODE" >> "$LOG"
+  send_tg "⚠️ [$TASK] inject failed (http=$HTTP_CODE)"
+  exit 2
+fi
+echo "[$TS] [$TASK] injected ok (http=200)" >> "$LOG"
+
+# ── 3. Post-sync: commit vault changes + push ────────────────────────────────
+SYNC_ERR=""
+cd "$VAULT" || SYNC_ERR="cd vault failed"
+if [ -z "$SYNC_ERR" ]; then
+  GIT_TERMINAL_PROMPT=0 git add -A 2>>"$LOG"
+  if ! GIT_TERMINAL_PROMPT=0 git diff --cached --quiet; then
+    GIT_TERMINAL_PROMPT=0 git commit -m "scheduled: $TASK $TS" >>"$LOG" 2>&1 || SYNC_ERR="git commit failed"
+  fi
+fi
+if [ -z "$SYNC_ERR" ]; then
+  GIT_TERMINAL_PROMPT=0 git fetch origin main >>"$LOG" 2>&1 || true
+  if ! GIT_TERMINAL_PROMPT=0 git merge --ff-only origin/main >>"$LOG" 2>&1; then
+    if ! GIT_TERMINAL_PROMPT=0 git merge --no-edit -m "auto-merge post-task ($TASK $TS)" origin/main >>"$LOG" 2>&1; then
+      GIT_TERMINAL_PROMPT=0 git merge --abort >/dev/null 2>&1 || true
+      SYNC_ERR="post-sync merge failed (manual)"
+    fi
+  fi
+fi
+if [ -z "$SYNC_ERR" ]; then
+  GIT_TERMINAL_PROMPT=0 git push origin main >>"$LOG" 2>&1 || SYNC_ERR="git push failed"
+fi
+[ -n "$SYNC_ERR" ] && send_tg "⚠️ [$TASK] sync: $SYNC_ERR"
+
+echo "[$TS] [$TASK] done (reply posted by resident)" >> "$LOG"

@@ -1,0 +1,14 @@
+# /etc/systemd/system/claude-morning-brief.timer
+# Fire the morning brief Mon-Fri at 08:00 in the configured timezone.
+# Adjust OnCalendar to taste (e.g. daily, weekdays only, different time).
+
+[Unit]
+Description=Timer: morning brief Mon-Fri 08:00 local time
+
+[Timer]
+OnCalendar=Mon..Fri 08:00:00 <your-timezone>   # e.g. Europe/Moscow
+Persistent=true
+Unit=claude-morning-brief.service
+
+[Install]
+WantedBy=timers.target

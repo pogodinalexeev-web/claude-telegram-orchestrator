@@ -1,0 +1,21 @@
+# ~/.config/systemd/user/vault-rag.service
+# Semantic search daemon for the Obsidian vault.
+# Keeps the embedding model warm so searches return in < 0.6 s.
+# Re-indexes after every git sync (incremental, no manual rebuild needed).
+#
+# Install (as the bot user, no root):
+#   cp vault-rag.service.example ~/.config/systemd/user/vault-rag.service
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now vault-rag
+
+[Unit]
+Description=vault-rag semantic search daemon
+After=default.target
+
+[Service]
+ExecStart=%h/vault-rag/venv/bin/python %h/vault-rag/daemon.py
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,18 @@
+# ~/.config/systemd/user/tg-bot-backup.service
+# One-shot service: mirror tg-bot.py into the vault repo.
+# Triggered by the companion .timer every hour.
+#
+# Install (as the bot user):
+#   cp tg-bot-backup.service.example ~/.config/systemd/user/tg-bot-backup.service
+#   cp tg-bot-backup.timer.example   ~/.config/systemd/user/tg-bot-backup.timer
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now tg-bot-backup.timer
+
+[Unit]
+Description=Backup tg-bot.py to vault (one-way mirror)
+
+[Service]
+Type=oneshot
+ExecStart=%h/bin/backup-tg-bot.sh
+StandardOutput=journal
+StandardError=journal

@@ -1,0 +1,13 @@
+# ~/.config/systemd/user/tg-bot-backup.timer
+# Run backup-tg-bot.sh hourly; also fire 2 min after boot.
+
+[Unit]
+Description=Hourly tg-bot.py backup to vault
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=1h
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,24 @@
+# /etc/systemd/system/claude-morning-brief.service
+# Scheduled briefing: runs a headless Claude Code prompt in the vault,
+# injects it into the resident bot process, which then posts the reply to TG.
+# See also: claude-task.sh.example for the injection mechanism.
+#
+# Install:
+#   cp claude-morning-brief.service.example /etc/systemd/system/claude-morning-brief.service
+#   cp claude-morning-brief.timer.example   /etc/systemd/system/claude-morning-brief.timer
+#   systemctl daemon-reload
+#   systemctl enable --now claude-morning-brief.timer
+
+[Unit]
+Description=Claude scheduled: morning brief
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=<bot-user>
+Group=<bot-user>
+Environment=TZ=<your-timezone>           # e.g. Europe/Moscow
+WorkingDirectory=<install-dir>/vault
+ExecStart=<install-dir>/bin/claude-task.sh morning-brief \
+  'Run /daily-prep. After the daily note is created, reply with a short brief: top-3 for today + 1 line on anything stuck. No filler.'
