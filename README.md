@@ -1,151 +1,159 @@
 # claude-telegram-orchestrator
 
-A **personal AI assistant that lives in Telegram**. The bot is the transport and
-control layer; a long-lived **Claude Code** agent (`claude -p`) is the engine — all
-reasoning and tool use happen inside it. Built and hardened over ~2 months of daily
-use, it runs on a VPS and a Mac in sync, and powers several separate users from one
-shared skill pool.
+> A personal AI assistant that lives in Telegram — a thin control layer that drives a
+> long-lived **Claude Code** agent as its engine.
 
-The hard parts aren't "send a message to Telegram" — they're keeping a long-running
-agent **fast** (a resident process per chat), **honest and on-task** (a layer of hooks
-that fix model drift), **grounded** (semantic search over a personal knowledge base),
-**durable** (a file-based long-term memory and two-way Mac↔VPS sync), and **capable**
-(its own Telegram infrastructure, a browser bridge, voice, calendar, background jobs).
+![Python](https://img.shields.io/badge/python-3670A0?style=for-the-badge&logo=python&logoColor=ffdd54)
+![Linux](https://img.shields.io/badge/Linux-FCC624?style=for-the-badge&logo=linux&logoColor=black)
+![Docker](https://img.shields.io/badge/docker-%230db7ed.svg?style=for-the-badge&logo=docker&logoColor=white)
+![SQLite](https://img.shields.io/badge/sqlite-%2307405e.svg?style=for-the-badge&logo=sqlite&logoColor=white)
+![Telegram](https://img.shields.io/badge/Telegram-26A5E4?style=for-the-badge&logo=telegram&logoColor=white)
+![Powered by Claude Code](https://img.shields.io/badge/powered%20by-Claude%20Code-D97757?style=for-the-badge)
+![License: MIT](https://img.shields.io/badge/License-MIT-green.svg?style=for-the-badge)
 
-> Claude Code is a dependency (the engine), not part of this repository. This repo is
-> a **portfolio extract** of a working personal assistant, with all private data
-> removed — names, paths, cabinets and secrets are stubbed or read from the
-> environment. It includes the orchestrator, the search engine, the discipline hooks,
-> the skill pool, infrastructure examples and a vault skeleton.
+🇷🇺 [Русская версия](README.ru.md)
 
-🇷🇺 Russian version: [README.ru.md](README.ru.md)
+The bot is the transport and control layer; all reasoning and tool use happen inside a
+long-lived `claude -p` process. Built and hardened over ~2 months of daily use, it runs
+on a VPS and a Mac in sync, and serves several separate users from one shared skill
+pool.
 
-## What's in this repository
+## TL;DR
 
-| File | What it is |
-| --- | --- |
-| `resident_claude.py` | The engine wrapper: one long-lived `claude -p --input-format stream-json` process, with a watchdog and a protocol-interrupt "catch-up". |
-| `bot.py` | A **minimal** orchestrator (~150 lines) — the core loop in its clearest form: long-poll, one resident per chat, stream the reply back. Good place to start reading. |
-| `tg_bot.py` | The **full** bot — attachments, reply markers, media/voice sending, long-message chunking, inline menu, voice transcription, calendar, background jobs. |
-| `deep_research/` | A browser bridge: drives a stealth browser on the server to use a "Deep Research" feature that only exists in the web UI, and reads the result back. |
-| `prompts/system_prompt.example.md` | A sanitized example system prompt — the *shape* of the rules without private content. |
-| `transcribe_native.py` | Voice transcription via a Premium Telegram user session (fast, no server CPU). |
-| `vault_rag/` | The semantic search engine over the knowledge base — hybrid (vector + full-text), local, GPU-free, with a warm daemon. See its own README. |
-| `hooks/` | ~30 Claude Code hooks — the discipline layer that fixes model drift (honesty, ground-truth, terse, plan-verify, audit) plus safety and sync hooks. |
-| `skills/` | 53 skills (slash-commands) — the assistant's capability pool, de-personalized. |
-| `infra/` | Deployment examples: own Telegram Bot API server (Docker), systemd units, the faster-whisper transcription shim, the Mac↔server sync script. |
-| `vault_example/` | A de-personalized skeleton of the knowledge base the assistant runs on (structure + rules, no content). |
+- **One agent per chat, kept warm** — the ~6-second cold start is paid once, not on
+  every message.
+- **53 skills**, **~30 discipline hooks**, a hybrid search engine, a long-term memory,
+  two-way Mac↔server sync — all in one system.
+- **Semantic search over a personal knowledge base** in **under ~0.6s**, locally, with
+  **no GPU and no external API**.
+- **Own Telegram Bot API server** lifts the file limit from 20 MB to **2 GB**.
+- Behaviour kept deterministic in code (markers + hooks), not left to the model's whim.
 
 ## Architecture
 
+```mermaid
+flowchart LR
+    User([User]) -->|message| TG[Telegram]
+    TG <-->|long-poll| Bot
+
+    subgraph Orchestrator["Bot orchestrator (Python)"]
+        Bot[bot.py / tg_bot.py] -->|claude -p| Engine[[Resident Claude engine]]
+    end
+
+    Engine -->|read / write| Vault[(Knowledge base / vault)]
+    Vault -->|RAG search| Engine
+    Vault -.->|git sync| Remote[(VPS git mirror)]
+
+    subgraph Services["Services"]
+        BotAPI[Local Bot API server]
+        Browser[Browser bridge]
+        Voice[Voice / TTS]
+    end
+
+    Bot --> BotAPI
+    Engine --> Browser
+    Engine --> Voice
 ```
-Telegram  ──getUpdates──►  bot.py / tg_bot.py  ──stream-json──►  resident_claude.py  ──►  claude -p
-   ▲                              │                                  (one per chat)        (engine)
-   └──────────sendMessage─────────┘                                        │
-                                                                           ▼
-                            vault (knowledge base)  ◄──RAG / memory / git-sync──┘
-```
 
-## Full feature set
+## What's in this repository
 
-### Engine & sessions
-- **Resident process per chat.** One `claude -p` process is kept alive per
-  conversation; the ~6s cold start is paid once, later turns skip the Node + binary +
-  MCP load. (`resident_claude.py`)
-- **Catch-up via protocol interrupt.** A new message mid-answer interrupts the current
-  turn (not kills it) and starts a new turn on the same process, preserving history.
-- **Watchdog timeouts.** A watchdog thread kills the process on a turn or silence
-  timeout so a stalled tool-call can never hang the bot.
-- **Inline "⏹ Stop" button** that appears before the turn starts and kills the process
-  cleanly, keeping the partial text.
-- **Streaming output.** The reply appears token-by-token in a status message
-  (throttled), not as one final blob.
-- **Background jobs (`__BG_TASK__`).** Long jobs run in a watchdog thread; when done,
-  the bot opens a *separate* turn with the result and messages the user first — without
-  blocking the live chat.
-- **Session rotation & token accounting.** Per-chat session store; auto-suggests
-  `/compact` over time; a 3-horizon token counter (session / turn / msg).
-- **Quota-limit TTL mode.** On a Claude usage limit the bot silently files the incoming
-  message to the inbox with a 👀 reaction instead of failing.
+| File / folder | What it is |
+| --- | --- |
+| `bot.py` | A **minimal** orchestrator (~150 lines) — the core loop in its clearest form: long-poll, one resident per chat, stream the reply back. Start reading here. |
+| `tg_bot.py` | The **full** bot — attachments, reply markers, media/voice sending, chunking, inline menu, transcription, calendar, background jobs. |
+| `resident_claude.py` | The engine wrapper: one long-lived `claude -p` process, with a watchdog and a protocol-interrupt "catch-up". |
+| `deep_research/` | A browser bridge: drives a stealth browser on the server to use a web-UI-only feature and read the result back. |
+| `vault_rag/` | The semantic search engine — hybrid (vector + full-text), local, GPU-free, with a warm daemon. ([details](vault_rag/README.md)) |
+| `hooks/` | ~30 Claude Code hooks — the discipline layer that fixes model drift, plus safety and sync. |
+| `skills/` | 53 skills (slash-commands) — the assistant's capability pool, de-personalized. |
+| `infra/` | Deployment examples: own Bot API server (Docker), systemd units, the voice shim, the sync script. |
+| `vault_example/` | A de-personalized skeleton of the knowledge base (structure + rules, no content). |
+| `prompts/` | A sanitized example system prompt — the *shape* of the rules without private content. |
 
-### Memory & rules (fixing model drift)
-- **File-based long-term memory.** A `memory/` folder of `feedback_*` / `project_*`
-  notes with an index the agent reads and writes — knowledge that survives across
-  sessions, separate per instance.
-- **A "constitution" of behaviour files** (`SOUL.md`, `principles.md`, `autonomy.md`,
-  `audit-mode.md`) that define voice, rules, permissions and the audit stance.
-- **Hot rule reload — no restart.** The bot watches the rule/prompt files; on change it
-  injects the diff at the start of the next turn and notes "rules updated", without
-  breaking the Telegram thread.
-- **Discipline hooks that fix model drift.** A layer of hooks keeps the agent honest
-  and on-task, each firing on triggers and injecting guidance: `honesty-gate`
-  (mark facts / don't fabricate), `ground-truth-gate` (check the source before
-  claiming, don't answer from memory), `terse-gate` (be brief), `simple-language-gate`
-  (plain language + glossary), `verify-plan-gate` (require a plan + approval before
-  edits), `audit-gate` (nudge an audit before architectural decisions). Plus safety
-  hooks (`safety.sh` blocks dangerous shell, `tg-write-gate` gates outbound messages),
-  a `precompact-backup`, an `auto-commit-flush`, and more — ~30 hooks in total.
+## How it works
 
-### Semantic search (RAG over the vault)
-- **Hybrid search over the knowledge base.** Semantic (a multilingual MiniLM embedder
-  via `fastembed`, no GPU, no external API) + full-text (`SQLite FTS5`), merged with
-  reciprocal-rank fusion; results as `file:line`, under ~0.6s.
-- **A warm daemon** that keeps the model loaded, unloads after idle, and answers
-  `search` / `reindex` commands; autostarted via systemd (VPS) / launchd (Mac).
-- **Re-index after every message**, not before each search — so search is always
-  instant and never pays a batch-rebuild lag.
-- **Chat logs are indexed too** — the bot's own conversations are appended to the index
-  so "what did we discuss about X" is searchable.
+Each feature is described first **in plain English**, then with the technical detail.
 
-### Mac ↔ VPS synchronisation
-- **Two-way sync around every message.** A bare git repo is the transport; the VPS bot
-  syncs at the start of each turn, the Mac mirrors it symmetrically via a hook — neither
-  side loses work on an unclean exit.
-- **A rescue commit** before every fetch/merge so an interrupted session can't drop
-  files.
-- **Hourly self-backup** of the bot's own source into the vault (read-only mirror).
-- **Per-machine log files** so two instances never overwrite the same day's log; both
-  are indexed for search.
+### Keeping the agent fast
+*Plain English:* instead of starting the assistant from scratch on every message, it
+stays "awake" between messages, so replies come quickly.
+*Technical:* one `claude -p --input-format stream-json` process is kept resident per
+chat. A watchdog thread kills it on a turn/silence timeout so a stalled tool-call can't
+hang the bot. A new message mid-answer **interrupts** the current turn (not kills it)
+and starts a new one on the same process, preserving session history.
+
+### Keeping the agent honest (fixing model drift)
+*Plain English:* a set of automatic checks nudge the assistant to verify facts, stay
+brief, and not invent things — so it stays reliable over long use.
+*Technical:* ~30 hooks fire on triggers and inject guidance — `honesty-gate`,
+`ground-truth-gate` (check the source before claiming), `terse-gate`,
+`simple-language-gate`, `verify-plan-gate` (plan + approval before edits),
+`audit-gate`. Plus safety (`safety.sh` blocks dangerous shell, `tg-write-gate` gates
+outbound messages), `precompact-backup`, `auto-commit-flush`.
+
+### Grounded answers (search over a knowledge base)
+*Plain English:* the assistant can find anything in a personal notes vault — "where did
+I write about X" — instead of guessing.
+*Technical:* hybrid search — vector (a multilingual MiniLM embedder via `fastembed`, CPU
+only) + full-text (`SQLite FTS5`), merged with reciprocal-rank fusion. A warm daemon
+keeps the model loaded and answers in under ~0.6s; a turn-end hook re-indexes after each
+change so search is always instant. ([details](vault_rag/README.md))
+
+### Long-term memory & hot rules
+*Plain English:* the assistant remembers preferences and facts across sessions, and
+picks up rule changes without a restart.
+*Technical:* a `memory/` folder of notes the agent reads and writes; a "constitution"
+of behaviour files; on a rule-file change the bot injects the diff at the start of the
+next turn — no restart, no dropped thread.
+
+### Durable across machines
+*Plain English:* work is never lost — everything syncs between the laptop and the
+server automatically.
+*Technical:* a bare git repo is the transport; both sides sync around every message,
+with a rescue commit before each merge and per-machine log files.
 
 ### Telegram infrastructure (built, not off-the-shelf)
-- **Own Telegram Bot API server** (local mode, `127.0.0.1`) — raises the file limit
-  from 20 MB to **2 GB**; one server serves multiple bots, told apart by token.
-- **Own Telegram MCP server** — a Telethon user session that can message *any* chat as
-  the owner, send voice / files / reactions, edit and delete messages — beyond the Bot
-  API's "only who wrote first" limit. Outbound writes are gated by a hook.
-- **Multi-path voice transcription** — by clip length: a native Premium Telegram
-  session (length-independent, no server CPU; `transcribe_native.py`), an optional
-  local faster-whisper shim for short clips, and AssemblyAI for long audio, with
-  automatic fallback.
-- **Text-to-speech (`__TTS__`).** The model picks the voice; routed to zvukogram /
-  edge-tts.
-- **Google Calendar (MCP).** Two-stage event creation (`__CAL_PROPOSE__` → confirm →
-  create), all-day events, a pending state with TTL.
-- **Attachments.** Auto-save of photos/video/docs/audio to the vault, album
-  aggregation, a pending confirm/drop queue, a 30-day voice archive.
-- **Media replies.** File paths in the reply are sent back as photos or documents;
-  long messages are chunked under Telegram's limit with Markdown→HTML rendering.
-- **Inline navigation menu** for briefs/projects, with callback handling.
-- **Scheduled agents** via systemd timers (Moscow TZ): daily brief, reflection, weekly
-  review.
-- **Deploy copies for other people** — a template clones the whole bot (new user +
-  vault skeleton + clean rule files) onto the same shared skill pool.
+*Plain English:* custom plumbing so the bot can send big files, talk as the owner, do
+voice, calendar, and run long jobs that report back when done.
+*Technical:*
+- **Own Bot API server** (local mode) — 2 GB file limit; one server, many bots.
+- **Own Telegram MCP server** — a user session that can message any chat as the owner,
+  send voice/files/reactions, edit and delete (beyond the Bot API's limits).
+- **Voice transcription with fallbacks** — in production the primary path is Groq
+  Whisper; this extract ships the native Telegram path (`transcribe_native.py`), with an
+  optional local faster-whisper shim and AssemblyAI as fallbacks.
+- **Text-to-speech**, **Google Calendar** (two-stage create), **attachments**
+  (auto-save + confirm/drop), **inline menu**, **background jobs** that self-notify.
 
-### External integrations & tooling (a skill pool)
-The assistant carries **53 skills** (slash-commands). Highlights:
-- **Browser automation on the server** — a stealth browser (patchright + Chrome under
-  Xvfb) gets past Cloudflare for scraping and for UI-only features (`deep_research/`).
-- **Call-record pull & transcription** — log into a phone-operator web cabinet, pull
-  MP3 call records, transcribe with diarisation (AssemblyAI).
-- **Cinema / listings scrapers** — parse cinema schedules, filter and report on a
-  schedule.
-- **Media pulls** — Instagram reels (via Apify) and YouTube (subtitles / frames /
-  audio).
-- **Content & marketplace generation** — product cards, photoshoots, poster/affiche
-  generation, image/video generation.
-- **The vault funnel** — inbox-first capture, `/process-inbox`, `/atomize`,
-  `/weekly-review`, `/daily-prep`, and a 3-agent `/audit` (vault + web + challenger)
-  run before architectural decisions.
+### A capability pool
+*Plain English:* 53 ready commands — research, transcription, content generation,
+scrapers, the note funnel.
+*Technical:* skills (slash-commands) including a stealth-browser bridge past Cloudflare,
+call-record pull + diarised transcription, listings scrapers, media pulls
+(Instagram/YouTube), and a 3-agent `/audit` (vault + web + challenger) run before
+architectural decisions.
+
+## Why it's built this way (design decisions)
+
+- **Resident process, not per-message spawn** — traded a bit of memory for killing the
+  ~6s cold start on every turn.
+- **Local hybrid search, not a hosted vector DB** — no GPU, no per-query API cost, no
+  data leaving the box; runs on a small VPS.
+- **Behaviour in code (markers + hooks), not in prompts alone** — deterministic actions
+  (file writes, buttons, calendar) don't depend on the model complying.
+- **Own Bot API server** — the only way to move 2 GB files through Telegram.
+- **Two-way git sync with a rescue commit** — an unclean exit can't lose work.
+
+## Tech stack
+
+| Layer | Tools |
+| --- | --- |
+| Language / runtime | Python 3 (stdlib-first), Linux, systemd |
+| Engine | Claude Code (`claude -p`, stream-json) |
+| Search | `fastembed` (MiniLM, 384-dim), `sqlite-vec`, SQLite FTS5 |
+| Telegram | local Bot API server (Docker), Telethon (user session) |
+| Browser | patchright (stealth) + Chrome under Xvfb |
+| Sync / infra | git (bare remote), Docker, systemd timers |
 
 ## Run
 
@@ -161,17 +169,18 @@ python bot.py
 
 It needs the `claude` binary on PATH (the engine) and a Telegram bot token. That's it.
 
-**The full bot** (`tg_bot.py`) is the production version and has more requirements:
+**The full bot** (`tg_bot.py`) is the production version:
 
-- It talks to a **local Telegram Bot API server** (for 2 GB file support), not
-  `api.telegram.org` directly — start it first from
-  [`infra/docker-compose.bot-api.yml`](infra/docker-compose.bot-api.yml).
-- Optional features pull extra packages on demand (e.g. `faster-whisper` for the local
-  voice shim) — see `requirements.txt`.
-- Semantic search (`vault_rag/`) has its own dependencies and setup — see
+- talks to a **local Telegram Bot API server** (2 GB files) — start it from
+  [`infra/docker-compose.bot-api.yml`](infra/docker-compose.bot-api.yml) first;
+- optional features pull extra packages on demand (e.g. `faster-whisper`);
+- semantic search (`vault_rag/`) has its own setup — see
   [`vault_rag/README.md`](vault_rag/README.md).
 
 ## Notes
 
-- Portfolio extract — a faithful, de-personalized copy of a working bot, not a toy.
-- All paths and secrets are read from the environment; see `.env.example`.
+> Claude Code is a dependency (the engine), not part of this repository. This repo is a
+> **portfolio extract** of a working personal assistant, with all private data removed —
+> names, paths, cabinets and secrets are stubbed or read from the environment. It
+> includes the orchestrator, the search engine, the discipline hooks, the skill pool,
+> infrastructure examples and a vault skeleton.
