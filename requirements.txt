@@ -1,0 +1,11 @@
+# Core bot (bot.py / tg_bot.py + resident_claude.py) talks to Telegram over the
+# stdlib and drives the external `claude` binary — no package needed for that part.
+
+# Native voice transcription via a Premium user session:
+telethon>=1.36
+
+# Deep-research browser bridge (deep_research/*):
+patchright>=1.40
+
+# Optional local speech-to-text fallback (only if you enable the Whisper path):
+# faster-whisper>=1.0
