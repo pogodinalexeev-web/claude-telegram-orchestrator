@@ -117,9 +117,10 @@ Telegram  ──getUpdates──►  bot.py / tg_bot.py  ──stream-json──
   имени владельца, слать голос / файлы / реакции, править и удалять сообщения — за
   пределами Bot API-ограничения «только тот, кто написал первым». Исходящие записи
   гейтируются крюком.
-- **4-ступенчатая маршрутизация расшифровки голоса** — Groq Whisper первым, дальше по
-  длине: резидентный faster-whisper-shim (≤20с), родная Premium-сессия (20с–5мин),
-  AssemblyAI (>5мин), с авто-fallback по квоте.
+- **Расшифровка голоса несколькими путями** — по длине записи: родная Premium-сессия
+  Telegram (не зависит от длины, без CPU сервера; `transcribe_native.py`),
+  опциональный локальный faster-whisper-shim для коротких, и AssemblyAI для длинных, с
+  авто-fallback.
 - **Синтез речи (`__TTS__`).** Голос выбирает модель; маршрут на zvukogram / edge-tts.
 - **Google Calendar (MCP).** Двухстадийное создание события (`__CAL_PROPOSE__` →
   подтвердить → создать), события на весь день, отложенное состояние с TTL.
@@ -134,7 +135,7 @@ Telegram  ──getUpdates──►  bot.py / tg_bot.py  ──stream-json──
   пользователь + скелет vault + чистые файлы правил) на тот же общий пул навыков.
 
 ### Внешние интеграции и инструментарий (пул навыков)
-Ассистент несёт **~55 навыков** (слэш-команд). Ключевое:
+Ассистент несёт **53 навыка** (слэш-команд). Ключевое:
 - **Браузерная автоматизация на сервере** — стелс-браузер (patchright + Chrome под
   Xvfb) обходит Cloudflare для парсинга и для функций из веб-интерфейса
   (`deep_research/`).
@@ -152,12 +153,27 @@ Telegram  ──getUpdates──►  bot.py / tg_bot.py  ──stream-json──
 
 ## Запуск
 
+**Минимальный бот** (`bot.py`) говорит со стандартным API Telegram и заводится из
+коробки — с него удобно начать:
+
 ```bash
-cp .env.example .env      # впиши свои значения
+cp .env.example .env                 # задай хотя бы TELEGRAM_BOT_TOKEN + TELEGRAM_ALLOWLIST
 pip install -r requirements.txt
 set -a; source .env; set +a
-python bot.py             # минимальная версия — или: python tg_bot.py для полной
+python bot.py
 ```
+
+Нужны: бинарник `claude` в PATH (движок) и токен бота Telegram. Всё.
+
+**Полный бот** (`tg_bot.py`) — продакшн-версия, требований больше:
+
+- Говорит с **локальным Telegram Bot API server** (для файлов до 2 ГБ), а не напрямую
+  с `api.telegram.org` — подними его первым из
+  [`infra/docker-compose.bot-api.yml`](infra/docker-compose.bot-api.yml).
+- Опциональные функции тянут доп. пакеты по месту (напр. `faster-whisper` для
+  локального голосового shim) — см. `requirements.txt`.
+- Смысловой поиск (`vault_rag/`) имеет свои зависимости и настройку — см.
+  [`vault_rag/README.md`](vault_rag/README.md).
 
 ## Примечания
 

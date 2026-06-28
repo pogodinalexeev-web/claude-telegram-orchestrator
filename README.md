@@ -113,9 +113,10 @@ Telegram  ──getUpdates──►  bot.py / tg_bot.py  ──stream-json──
 - **Own Telegram MCP server** — a Telethon user session that can message *any* chat as
   the owner, send voice / files / reactions, edit and delete messages — beyond the Bot
   API's "only who wrote first" limit. Outbound writes are gated by a hook.
-- **4-step voice transcription routing** — Groq Whisper first, then by length: a
-  resident faster-whisper shim (≤20s), a native Premium session (20s–5min), AssemblyAI
-  (>5min), with automatic fallback on quota.
+- **Multi-path voice transcription** — by clip length: a native Premium Telegram
+  session (length-independent, no server CPU; `transcribe_native.py`), an optional
+  local faster-whisper shim for short clips, and AssemblyAI for long audio, with
+  automatic fallback.
 - **Text-to-speech (`__TTS__`).** The model picks the voice; routed to zvukogram /
   edge-tts.
 - **Google Calendar (MCP).** Two-stage event creation (`__CAL_PROPOSE__` → confirm →
@@ -131,7 +132,7 @@ Telegram  ──getUpdates──►  bot.py / tg_bot.py  ──stream-json──
   vault skeleton + clean rule files) onto the same shared skill pool.
 
 ### External integrations & tooling (a skill pool)
-The assistant carries **~55 skills** (slash-commands). Highlights:
+The assistant carries **53 skills** (slash-commands). Highlights:
 - **Browser automation on the server** — a stealth browser (patchright + Chrome under
   Xvfb) gets past Cloudflare for scraping and for UI-only features (`deep_research/`).
 - **Call-record pull & transcription** — log into a phone-operator web cabinet, pull
@@ -148,12 +149,27 @@ The assistant carries **~55 skills** (slash-commands). Highlights:
 
 ## Run
 
+**The minimal bot** (`bot.py`) talks to the standard Telegram API and runs out of the
+box — a good place to start:
+
 ```bash
-cp .env.example .env      # fill in your values
+cp .env.example .env                 # set at least TELEGRAM_BOT_TOKEN + TELEGRAM_ALLOWLIST
 pip install -r requirements.txt
 set -a; source .env; set +a
-python bot.py             # minimal version — or: python tg_bot.py for the full one
+python bot.py
 ```
+
+It needs the `claude` binary on PATH (the engine) and a Telegram bot token. That's it.
+
+**The full bot** (`tg_bot.py`) is the production version and has more requirements:
+
+- It talks to a **local Telegram Bot API server** (for 2 GB file support), not
+  `api.telegram.org` directly — start it first from
+  [`infra/docker-compose.bot-api.yml`](infra/docker-compose.bot-api.yml).
+- Optional features pull extra packages on demand (e.g. `faster-whisper` for the local
+  voice shim) — see `requirements.txt`.
+- Semantic search (`vault_rag/`) has its own dependencies and setup — see
+  [`vault_rag/README.md`](vault_rag/README.md).
 
 ## Notes
 
