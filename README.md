@@ -1,7 +1,7 @@
 # claude-telegram-orchestrator
 
-> A personal AI assistant that lives in Telegram — a thin control layer that drives a
-> long-lived **Claude Code** agent as its engine.
+> A personal AI assistant that lives in Telegram — a **custom harness** (orchestration
+> layer) that drives a long-lived **Claude Code** agent as its engine.
 
 ![Python](https://img.shields.io/badge/python-3670A0?style=for-the-badge&logo=python&logoColor=ffdd54)
 ![Linux](https://img.shields.io/badge/Linux-FCC624?style=for-the-badge&logo=linux&logoColor=black)
@@ -33,26 +33,35 @@ pool.
 
 ```mermaid
 flowchart LR
-    User([User]) -->|message| TG[Telegram]
+    User([👤 User]) -->|message| TG[✈️ Telegram]
     TG <-->|long-poll| Bot
 
-    subgraph Orchestrator["Bot orchestrator (Python)"]
-        Bot[bot.py / tg_bot.py] -->|claude -p| Engine[[Resident Claude engine]]
+    subgraph Harness["🧩 Custom harness · Python"]
+        Bot["bot.py / tg_bot.py"] -->|claude -p stream-json| Engine[["🧠 Resident Claude engine"]]
     end
 
-    Engine -->|read / write| Vault[(Knowledge base / vault)]
-    Vault -->|RAG search| Engine
-    Vault -.->|git sync| Remote[(VPS git mirror)]
+    Engine -->|read / write| Vault[("🗄️ Knowledge base<br/>vault")]
+    Vault -->|🔍 RAG search| Engine
+    Vault -.->|git sync| Remote[("☁️ VPS git mirror")]
 
-    subgraph Services["Services"]
-        BotAPI[Local Bot API server]
-        Browser[Browser bridge]
-        Voice[Voice / TTS]
+    subgraph Services["⚙️ Services"]
+        BotAPI["📦 Local Bot API<br/>2 GB files"]
+        Browser["🌐 Browser bridge"]
+        Voice["🎙️ Voice / TTS"]
     end
 
     Bot --> BotAPI
     Engine --> Browser
     Engine --> Voice
+
+    classDef actor fill:#2b6cb0,color:#fff,stroke:#1a4971,stroke-width:1px;
+    classDef engine fill:#D97757,color:#fff,stroke:#a8542f,stroke-width:1px;
+    classDef store fill:#2f855a,color:#fff,stroke:#1c4d36,stroke-width:1px;
+    classDef svc fill:#6b46c1,color:#fff,stroke:#44307d,stroke-width:1px;
+    class User,TG actor;
+    class Engine engine;
+    class Vault,Remote store;
+    class BotAPI,Browser,Voice svc;
 ```
 
 ## What's in this repository

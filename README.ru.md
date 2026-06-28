@@ -1,7 +1,8 @@
 # claude-telegram-orchestrator
 
-> Персональный AI-ассистент, живущий в Telegram — тонкий слой управления, который
-> гоняет долгоживущий агент **Claude Code** как движок.
+> Персональный AI-ассистент, живущий в Telegram — **самописная обвязка (custom
+> harness)**, слой оркестрации, который гоняет долгоживущий агент **Claude Code** как
+> движок.
 
 ![Python](https://img.shields.io/badge/python-3670A0?style=for-the-badge&logo=python&logoColor=ffdd54)
 ![Linux](https://img.shields.io/badge/Linux-FCC624?style=for-the-badge&logo=linux&logoColor=black)
@@ -34,26 +35,35 @@
 
 ```mermaid
 flowchart LR
-    User([Пользователь]) -->|сообщение| TG[Telegram]
+    User([👤 Пользователь]) -->|сообщение| TG[✈️ Telegram]
     TG <-->|long-poll| Bot
 
-    subgraph Orchestrator["Бот-оркестратор (Python)"]
-        Bot[bot.py / tg_bot.py] -->|claude -p| Engine[[Резидентный движок Claude]]
+    subgraph Harness["🧩 Самописная обвязка · Python"]
+        Bot["bot.py / tg_bot.py"] -->|claude -p stream-json| Engine[["🧠 Резидентный движок Claude"]]
     end
 
-    Engine -->|чтение / запись| Vault[(База знаний / vault)]
-    Vault -->|RAG-поиск| Engine
-    Vault -.->|git-синхра| Remote[(git-зеркало на VPS)]
+    Engine -->|чтение / запись| Vault[("🗄️ База знаний<br/>vault")]
+    Vault -->|🔍 RAG-поиск| Engine
+    Vault -.->|git-синхра| Remote[("☁️ git-зеркало на VPS")]
 
-    subgraph Services["Сервисы"]
-        BotAPI[Локальный Bot API server]
-        Browser[Браузерный мост]
-        Voice[Голос / TTS]
+    subgraph Services["⚙️ Сервисы"]
+        BotAPI["📦 Локальный Bot API<br/>файлы 2 ГБ"]
+        Browser["🌐 Браузерный мост"]
+        Voice["🎙️ Голос / TTS"]
     end
 
     Bot --> BotAPI
     Engine --> Browser
     Engine --> Voice
+
+    classDef actor fill:#2b6cb0,color:#fff,stroke:#1a4971,stroke-width:1px;
+    classDef engine fill:#D97757,color:#fff,stroke:#a8542f,stroke-width:1px;
+    classDef store fill:#2f855a,color:#fff,stroke:#1c4d36,stroke-width:1px;
+    classDef svc fill:#6b46c1,color:#fff,stroke:#44307d,stroke-width:1px;
+    class User,TG actor;
+    class Engine engine;
+    class Vault,Remote store;
+    class BotAPI,Browser,Voice svc;
 ```
 
 ## Что в этом репозитории
