@@ -91,6 +91,10 @@ chat. A watchdog thread kills it on a turn/silence timeout so a stalled tool-cal
 hang the bot. A new message mid-answer **interrupts** the current turn (not kills it)
 and starts a new one on the same process, preserving session history.
 
+*Measured (live logs):* wrapper overhead from message receipt to model start is **~0.1s**
+(114–119 ms on text). Time-to-first-token (**~4.5–12s** on Opus, cache-warm) is set by the
+model, not the wrapper — the resident process keeps our own overhead negligible.
+
 ### Keeping the agent honest (fixing model drift)
 *Plain English:* a set of automatic checks nudge the assistant to verify facts, stay
 brief, and not invent things — so it stays reliable over long use.
