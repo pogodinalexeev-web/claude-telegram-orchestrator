@@ -155,6 +155,19 @@ architectural decisions.
 | Browser | patchright (stealth) + Chrome under Xvfb |
 | Sync / infra | git (bare remote), Docker, systemd timers |
 
+## What it takes to run
+
+This is a portfolio extract, but it's not a museum piece — `bot.py` actually runs.
+
+- **Just reading the code?** No setup — browse from `bot.py` (the clearest entry point),
+  then the architecture diagram and feature sections.
+- **Want to run the demo?** Three commands (below). You need: Python 3, a Telegram bot
+  token from [@BotFather](https://t.me/BotFather), and the **Claude Code CLI**
+  (`claude`) signed in to an Anthropic account — that's the engine the bot drives, so
+  it's required by design.
+- **The full `tg_bot.py`** is the production build (local Bot API server + more config).
+  It's here to show real architecture, not as a one-command install.
+
 ## Run
 
 **The minimal bot** (`bot.py`) talks to the standard Telegram API and runs out of the
