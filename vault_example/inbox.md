@@ -1,19 +1,14 @@
-# inbox — single capture point
+# Входящие
 
-Everything dropped to the bot (text, voice, forwards, links) lands here first, in the
-canonical format below, and gets sorted later by `/process-inbox`. No sorting at
-capture time — just capture.
+> Единая точка захвата. Сюда падает всё: мысли, голосовые, пересланные сообщения.
+> Не сортируем — только ловим. Разбор — отдельным заходом.
 
-Canonical entry format (the `---` separator is required; the parser splits on it):
+Формат записи:
 
 ```
 ---
-YYYY-MM-DD HH:MM (source)
-<the captured text>
+YYYY-MM-DD HH:MM (источник)
+текст
 ```
 
-`source` ∈ `TG` (typed), `voice` (transcribed), `forward`, `capture`, `manual`.
-
----
-YYYY-MM-DD HH:MM (voice)
-example capture — a stray thought to sort later
+Источник: `TG` · `voice` · `capture` · `forward` · `manual`.

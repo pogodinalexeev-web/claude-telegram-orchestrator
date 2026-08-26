@@ -1,21 +1,10 @@
-# status — current state (single source of truth)
+# Статус
 
-*Updated: YYYY-MM-DD — one-line summary of where things stand.*
+*Обновлено: 1970-01-01 00:00.*
 
-> This is a de-personalized example. In the real vault `status.md` holds the current
-> focus and all open architectural "loops", and the session-start hook reads it to
-> brief the assistant at the start of each session.
+Что горит сейчас — одним абзацем. Этот файл читается в начале каждой сессии,
+поэтому здесь живёт состояние, а не хроника: хроника в `Journal/log.md`.
 
-## Guiding star
+## Открытые петли
 
-<the one long-term direction everything is measured against>
-
-## Active projects
-
-- **<Project A>** — <one line: what and why> · status: <in progress>
-- **<Project B>** — <one line> · status: <blocked on X>
-
-## Open loops
-
-- [ ] <a large / architectural task that spans sessions>
-- [ ] <another>
+- [ ] пример: настроить бота и проверить, что заметки ищутся

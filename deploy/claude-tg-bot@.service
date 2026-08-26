@@ -1,0 +1,25 @@
+[Unit]
+# ЗАГОТОВКА, НА ЖИВУЮ СИСТЕМУ НЕ ПОСТАВЛЕНА (шаг 6 пересборки, 19.08.2026).
+# Один файл юнита на всех: claude-tg-bot@owner, claude-tg-bot@alpha и т.д.
+# %i — имя экземпляра, оно же имя системного пользователя. Профиль ядро
+# находит по нему же (pwd.getpwuid), так что «чей я» задаётся одним словом.
+Description=Claude TG-funnel bot (%i)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=%i
+Group=%i
+WorkingDirectory=/home/%i
+# TZ, HOME, PATH с nvm — всё, что раньше было размазано по личным юнитам.
+# Минус перед путём = «нет файла, и ладно».
+EnvironmentFile=-/etc/claude-tg-%i/env
+ExecStart=/usr/bin/python3 /opt/claude-tg/tg-bot.py
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

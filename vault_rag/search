@@ -1,6 +1,21 @@
 #!/bin/bash
-# Смысловой поиск по vault через дежурного (держит модель, досборка на лету).
-# Пути — относительно расположения скрипта (через симлинк работает на любой машине).
-# Usage: ./search "запрос" [k]
+# Смысловой поиск по vault через дежурного (держит модель, тёплый кэш векторов).
+# Горячий путь — nc к сокету (мгновенный старт, 26.08.2026); python — запасной
+# (поднимает дежурного, если тот мёртв). Usage: ./search "запрос" [k]
 DIR="$(cd "$(dirname "$0")" && pwd)"
+SOCK="$DIR/daemon.sock"
+Q="$1"; K="${2:-5}"
+if [ -S "$SOCK" ] && command -v nc >/dev/null 2>&1; then
+    # экранируем \ и " для JSON
+    ESC="${Q//\\/\\\\}"; ESC="${ESC//\"/\\\"}"
+    # -N (закрыть запись после EOF) есть у linux-nc, у мак-nc такого флага нет
+    NCN=""; nc -h 2>&1 | grep -q -- "-N" && NCN="-N"
+    TMOUT_CMD="timeout"; command -v timeout >/dev/null 2>&1 || TMOUT_CMD="gtimeout"
+    command -v "$TMOUT_CMD" >/dev/null 2>&1 || TMOUT_CMD=""
+    OUT="$(printf %s "{\"q\":\"$ESC\",\"k\":$K}" | $TMOUT_CMD ${TMOUT_CMD:+20} nc $NCN -U "$SOCK" 2>/dev/null)"
+    if [ -n "$OUT" ]; then
+        printf "%s\n" "$OUT"
+        exit 0
+    fi
+fi
 exec "$DIR/venv/bin/python" "$DIR/search_client.py" "$@"

@@ -1,22 +1,32 @@
-"""Machine-specific config for vault_rag — copy to localcfg.py and edit.
-localcfg.py is gitignored: each machine has its own (paths differ between
-a laptop and a server). Keeping it out of git lets the rest of the code use
-relative imports and stay identical everywhere.
+"""Машинная настройка поиска. Скопируйте в localcfg.py рядом с кодом — он вне git,
+у каждой машины свой. Ядро поиска никаких путей больше ниоткуда не берёт.
 """
 
-# Absolute path to the knowledge base (vault) root to index.
-VAULT = "/path/to/your/vault"
+# Где лежат заметки, по которым ищем.
+VAULT = "/home/owner/vault"
 
-# Where the agent's chat-session .jsonl files live (used by chatlog.py to
-# rebuild the daily conversation log that also gets indexed).
-SESSIONS_PROJ = "/path/to/claude/projects/<project-slug>"
+# Где Claude Code хранит сессии — из них собирается лог разговоров (chatlog.py).
+SESSIONS_PROJ = "/home/owner/.claude/projects/-home-owner-vault"
 
-# Suffix for the daily chat-log file, to tell two machines apart
-# (e.g. "-mac" on one, "" on the other) so they don't overwrite each other.
+# Суффикс имени дневного файла лога: "" у бота, "-mac" у ноутбука.
+# Две машины пишут в разные файлы, чтобы не затирать друг друга.
 CHATLOG_SUFFIX = ""
 
-# Label for the assistant's replies in the rebuilt log.
-CHATLOG_WHO = "Assistant"
+# Как подписывать реплики не-хозяина в логе разговора.
+CHATLOG_WHO = "бот"
 
-# Label for the owner's messages in the rebuilt log.
-OWNER_LABEL = "Owner"
+# Имя хозяина для подписи его реплик.
+CHATLOG_OWNER = "Owner"
+
+# Какие расширения тянуть в индекс. По умолчанию только заметки.
+# EXTS = (".md", ".txt")
+
+# ── Мульти-режим (один демон на машину, несколько независимых хранилищ) ──
+# Раскомментируйте, если на машине живёт больше одного хранилища.
+# У каждого жильца свои база, матрица векторов и сокет с его правами 0600 —
+# чужое хранилище не спросить даже случайно.
+#
+# TENANTS = [
+#     {"name": "owner", "ragdir": "/home/owner/vault-rag", "vault": "/home/owner/vault"},
+#     {"name": "alpha", "ragdir": "/home/alpha/vault-rag", "vault": "/home/alpha/vault"},
+# ]

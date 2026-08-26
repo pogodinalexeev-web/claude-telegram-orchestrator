@@ -1,13 +1,9 @@
-# tasks — concrete actions
+# Задачи
 
-Closed tasks don't accumulate here: a finished item is deleted (the fact lands in
-`Journal/log.md`) or, for a project task, moved to that project's `log.md`.
+## Открытые
 
-## Open
+- [ ] пример задачи, которую можно закрыть и удалить
 
-- [ ] <a concrete next action>
-- [ ] <another> #life
+## Триггеры по дате
 
-## Date triggers
-
-- [ ] YYYY-MM-DD — <do X on this date> (the daily-prep skill surfaces these when due)
+- [ ] 1970-01-01 — пример отложенного напоминания

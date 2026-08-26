@@ -21,13 +21,19 @@ pool.
 ## TL;DR
 
 - **One agent per chat, kept warm** — the ~6-second cold start is paid once, not on
-  every message.
-- **53 skills**, **~30 discipline hooks**, a hybrid search engine, a long-term memory,
-  two-way Mac↔server sync — all in one system.
-- **Semantic search over a personal knowledge base** in **under ~0.6s**, locally, with
-  **no GPU and no external API**.
-- **Own Telegram Bot API server** lifts the file limit from 20 MB to **2 GB**.
-- Behaviour kept deterministic in code (markers + hooks), not left to the model's whim.
+  every message. Idle residents are reaped; the thread survives via session resume.
+- **A shared core, several owners.** 15 modules, ~6,800 lines, zero personal values
+  inside — a new owner is a config file, not a fork. Enforced by a test that sweeps
+  every module for names, home paths and chat ids.
+- **Semantic search over a personal knowledge base** in **0.1–0.8s**, locally, with
+  **no GPU and no external API**. Vectors live as a matrix in RAM; the disk is not
+  touched on a query.
+- **Incremental indexing that actually works.** Appending a line to a 256 KB journal
+  re-embeds **1 chunk instead of 110** — a two-sided diff plus per-chunk ordinals.
+- **Deterministic behaviour in code** (action markers + hooks), not left to the
+  model's whim: dangerous actions are proposals awaiting confirmation.
+- **Two-way sync** where the remote address is never hardcoded — it comes from the
+  profile, or is asked of git itself.
 
 ## Architecture
 
@@ -69,15 +75,19 @@ flowchart LR
 | File / folder | What it is |
 | --- | --- |
 | `bot.py` | A **minimal** orchestrator (~150 lines) — the core loop in its clearest form: long-poll, one resident per chat, stream the reply back. Start reading here. |
-| `tg_bot.py` | The **full** bot — attachments, reply markers, media/voice sending, chunking, inline menu, transcription, calendar, background jobs. |
-| `resident_claude.py` | The engine wrapper: one long-lived `claude -p` process, with a watchdog and a protocol-interrupt "catch-up". |
-| `deep_research/` | A browser bridge: drives a stealth browser on the server to use a web-UI-only feature and read the result back. |
-| `vault_rag/` | The semantic search engine — hybrid (vector + full-text), local, GPU-free, with a warm daemon. ([details](vault_rag/README.md)) |
-| `hooks/` | ~30 Claude Code hooks — the discipline layer that fixes model drift, plus safety and sync. |
-| `skills/` | 53 skills (slash-commands) — the assistant's capability pool, de-personalized. |
-| `infra/` | Deployment examples: own Bot API server (Docker), systemd units, the voice shim, the sync script. |
+| `core/` | The **production core**: 15 modules, shared by every owner on the machine. Entry point `tg-bot.py`, then `intake` → `turn` → `claude_run`. See [`core/ARCHITECTURE.md`](core/ARCHITECTURE.md). |
+| `vault_rag/` | The semantic search engine — hybrid (vector + full-text), local, GPU-free, with a warm daemon serving several vaults at once. ([how and why](docs/rag-search.md)) |
+| `deploy/` | systemd unit, the sync package, a full profile example. |
+| `docs/` | Deep dives: [search](docs/rag-search.md), [sync](docs/sync.md). |
+| `tests/` | Pure-function tests and seam tests, including the isolation sweep. |
 | `vault_example/` | A de-personalized skeleton of the knowledge base (structure + rules, no content). |
+| `infra/` | Deployment examples: own Bot API server (Docker), systemd units, the voice shim. |
+| `deep_research/` | A browser bridge: drives a stealth browser on the server to use a web-UI-only feature and read the result back. |
 | `prompts/` | A sanitized example system prompt — the *shape* of the rules without private content. |
+
+> **Not included by design:** skills and behavioural hooks. They carry the owner's
+> entire working methodology — the part that cannot be anonymised without turning into
+> an empty husk. They are described in the sections below instead.
 
 ## How it works
 
@@ -146,6 +156,41 @@ call-record pull + diarised transcription, listings scrapers, media pulls
 (Instagram/YouTube), and a 3-agent `/audit` (vault + web + challenger) run before
 architectural decisions.
 
+
+### What a plain Claude Code wrapper doesn't have
+
+A plain wrapper takes text from Telegram, hands it to the model, prints the reply.
+Everything below is what makes a messenger a workable place instead of a demo.
+
+**Action markers — the bot acts instead of narrating.** The model can end a reply with
+a marker line, and the core turns it into a deterministic action: `__WROTE__` (saved to
+notes, with the file shown), `__CHOICES__` (buttons grow under the message), `__TASK__`
+(caught a task, into the list), `__TTS__` (speak it), `__BG_TASK__` (work longer than a
+turn: run it detached and **message me when done**). Dangerous actions —
+`__TG_SEND_PROPOSE__`, `__CAL_PROPOSE__` — are proposals awaiting confirmation, never
+autonomous acts. Thirteen markers in total, parsed in `core/markers.py`.
+
+**⏹ STOP that actually stops.** The button sits on the "got it, thinking…" message from
+the first second, before the model even starts. Press it and the process dies — while
+whatever was already typed **stays in the chat** instead of being thrown away.
+
+**Catch-up: a new message interrupts, not queues.** You add a clarification while the
+bot is thinking. A queue would answer the stale question; here the running turn is
+interrupted and a fresh one starts with your clarification included. The empty reply of
+the interrupted turn is suppressed so no stub lands in the chat.
+
+**A live panel instead of silence.** The "thinking…" message becomes a panel — what it
+is doing, how long, how many tools called — edited in place rather than spamming new
+messages. Telegram's native draft streaming was tried and dropped: three Android client
+glitches; editing proved more reliable.
+
+**Burst merging.** People write one thought as three messages. The core waits for a
+pause and merges them into a single turn — otherwise the bot answers a quarter of a
+thought three times. Photo albums collapse into one message too.
+
+**Vault navigation by buttons.** Categories, projects, subprojects — browsing notes by
+tapping, because typing `Projects/IT/Suppliers/log.md` on a phone is misery.
+
 ## Why it's built this way (design decisions)
 
 - **Resident process, not per-message spawn** — traded a bit of memory for killing the
@@ -156,6 +201,25 @@ architectural decisions.
   (file writes, buttons, calendar) don't depend on the model complying.
 - **Own Bot API server** — the only way to move 2 GB files through Telegram.
 - **Two-way git sync with a rescue commit** — an unclean exit can't lose work.
+
+
+## Measured
+
+Six-core box, 12 GB RAM; vault of ~1,700 notes / 39,000 chunks.
+
+| What | How much |
+| --- | --- |
+| Wrapper overhead, message receipt → model start | ~0.1 s |
+| Cold start of a model process | ~6 s, once per chat |
+| Search, idle machine | 0.1–0.8 s |
+| Search, six concurrent queries | 0.6–1.3 s |
+| Vector stage — matrix in RAM | 0.1–0.4 s |
+| Vector stage — when read from disk (before Aug 2026) | 2.7–4.0 s |
+| Index in memory | ~60 MB for 39k chunks |
+| Search daemon serving all owners | 0.9–1.5 GB |
+| Same, old scheme: one daemon per owner | 1.2–1.5 GB **each** |
+| Appending to a 256 KB journal | 1 chunk re-embedded, was 110 |
+| Core size | 15 modules, ~6,800 lines |
 
 ## Tech stack
 

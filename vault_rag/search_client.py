@@ -24,15 +24,31 @@ def try_send(q, k):
     return b"".join(chunks).decode("utf-8")
 
 
+def alive():
+    """Жив ли дежурный. Проверяем ПОДКЛЮЧЕНИЕМ, а не наличием файла (26.08.2026):
+    осиротевший сокет от убитого процесса остаётся на диске и врал, что всё хорошо."""
+    if not os.path.exists(SOCK):
+        return False
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(2)
+        s.connect(SOCK)
+        s.close()
+        return True
+    except OSError:
+        return False
+
+
 def ensure_daemon():
-    if os.path.exists(SOCK):
+    if alive():
         return
-    # поднять демон в фоне
+    # Поднять дежурного в фоне. Лишний экземпляр сам отвалится на замке (daemon.main),
+    # поэтому параллельные вызовы больше не плодят процессы.
     subprocess.Popen([PY, DAEMON], stdout=subprocess.DEVNULL,
                      stderr=subprocess.DEVNULL, start_new_session=True)
-    # ждать появления сокета (первая загрузка модели ~3-5с, с запасом до 40с)
-    for _ in range(80):
-        if os.path.exists(SOCK):
+    # ждать готовности; на нагруженной машине загрузка модели доходит до 90 секунд
+    for _ in range(180):
+        if alive():
             time.sleep(0.3)
             return
         time.sleep(0.5)

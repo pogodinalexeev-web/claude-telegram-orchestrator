@@ -6,15 +6,15 @@
 import json, glob, re, os, sys, datetime
 
 # Машинная специфика — в localcfg.py рядом с кодом (НЕ в git): где сессии, где vault,
-# суффикс файла (-mac на одной машине, пусто на другой), ярлык реплики ассистента.
-# OWNER_LABEL — как подписывать реплики владельца (из localcfg).
+# суффикс файла (-mac на Mac, пусто у бота), ярлык не-хозяйской реплики (Claude / бот).
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import localcfg
 PROJ = localcfg.SESSIONS_PROJ
 OUT = os.path.join(localcfg.VAULT, "Resources/chat-logs/processed")
 SUFFIX = localcfg.CHATLOG_SUFFIX
 WHO = localcfg.CHATLOG_WHO
-OWNER = getattr(localcfg, "OWNER_LABEL", "Owner")
+# Имя хозяина хранилища — для ярлыка его реплик. Дефолт Owner (каждый ставит своё).
+OWNER = getattr(localcfg, "CHATLOG_OWNER", "Owner")
 
 
 MSK = datetime.timezone(datetime.timedelta(hours=3))
@@ -86,10 +86,10 @@ def main():
         hh = ts[11:16] if len(ts) >= 16 else ""
         if hh[:2] != lasthour:
             lines.append(f"\n## {hh}\n"); lasthour = hh[:2]
-        is_owner = (role in ("user", "voice", "queue/voice", "queue-operation")
-                    or txt.startswith("[VOICE_TRANSCRIPT") or txt.startswith("[FORWARD")
-                    or txt.startswith("[ATTACHMENT"))
-        who = OWNER if is_owner else WHO
+        is_vlad = (role in ("user", "voice", "queue/voice", "queue-operation")
+                   or txt.startswith("[VOICE_TRANSCRIPT") or txt.startswith("[FORWARD")
+                   or txt.startswith("[ATTACHMENT"))
+        who = OWNER if is_vlad else WHO
         lines.append(f"**{who}:** {txt}\n")
     os.makedirs(OUT, exist_ok=True)
     tmp = os.path.join(OUT, f".{day}{SUFFIX}.tmp")
