@@ -59,11 +59,35 @@ def _dispatch_stray_turn(uid, chat_id, events):
     раньше копился в трубе и вываливался при следующем сообщении хозяина.
     Теперь читатель резидента отдаёт его сюда СРАЗУ по завершении — шлём в чат
     немедленно, тем же трактом: картинки, __BG_TASK__, текст."""
-    text = ""
-    for ev in reversed(events):
-        if ev.get("type") == "result":
-            text = ev.get("result") or ""
-            break
+    # 25.09.2026: берём ВЕСЬ текст хода, а не только result. Поле result несёт
+    # одну последнюю реплику (после крюка сохранения это строка 💾), основной
+    # ответ до неё терялся молча. Сборка как в основном тракте claude_run.
+    parts, got_stream, sep = [], False, False
+    for ev in events:
+        et = ev.get("type")
+        if et == "stream_event":
+            inner = ev.get("event") or {}
+            if inner.get("type") == "message_start":
+                sep = True
+            d = inner.get("delta") or {}
+            if inner.get("type") == "content_block_delta" and d.get("type") == "text_delta" and d.get("text"):
+                got_stream = True
+                if sep and parts:
+                    parts.append("\n\n")
+                sep = False
+                parts.append(d["text"])
+        elif et == "assistant" and not got_stream:
+            for blk in (ev.get("message") or {}).get("content") or []:
+                if blk.get("type") == "text" and blk.get("text"):
+                    if parts:
+                        parts.append("\n\n")
+                    parts.append(blk["text"])
+    text = "".join(parts).strip()
+    if not text:
+        for ev in reversed(events):
+            if ev.get("type") == "result":
+                text = ev.get("result") or ""
+                break
     if not (text or "").strip():
         return
     log(f"stray-turn flush → chat={chat_id}, {len(text)} chars")

@@ -129,7 +129,21 @@ class ResidentClaude:
             if self._consumer_active and self._q is not None:
                 self._q.put(ev)
             else:
-                self._turn_open = True
+                # 25.09.2026: ход считается начатым только по событию модели. Раньше
+                # флаг ставило ЛЮБОЕ событие между ходами (служебный шум без result),
+                # флаг залипал, и следующий нормальный ход целиком уходил в «ничейные»:
+                # ответ хозяину терялся, в чат шла одна последняя реплика, бот висел
+                # до ⏹СТОП (инцидент 00:45–00:49, голосовое про трубу).
+                etype = ev.get("type")
+                if etype in ("assistant", "stream_event", "user"):
+                    self._turn_open = True
+                elif not self._turn_open and etype != "result":
+                    try:
+                        import sys as _s
+                        print(f"[resident] idle event без хода: type={etype} "
+                              f"subtype={ev.get('subtype')}", file=_s.stderr, flush=True)
+                    except Exception:
+                        pass
                 self._stray_buf.append(ev)
                 if ev.get("type") == "result":
                     self._turn_open = False
@@ -171,6 +185,8 @@ class ResidentClaude:
         stray_prefix: list = []
         if pending_stray:
             stray_prefix, self._stray_buf = self._stray_buf, []
+        else:
+            self._stray_buf = []   # служебный шум между ходами, ход не открывал
         self._consumer_active = True
 
         msg = {"type": "user", "message": {"role": "user", "content": text}}
