@@ -29,6 +29,7 @@ set_stray_handler) — там, где модули иначе замкнулис
 - После каждого хода хранилище синхронизируется (модель могла писать файлы).
 - Файлы сохраняются во вложения, путь передаётся модели в запросе.
 """
+import os
 import http.server
 import json
 import socket
@@ -60,6 +61,7 @@ from botctx import (  # noqa: F401  (сквозной ре-экспорт для
     PENDING_SEND_TTL_SEC, TG_SEND_ONESHOT, TG_SEND_PYTHON, TASKS_FILE,
     ALBUM_BUFFER_SEC, BURST_BUFFER_SEC, MSK, CLAUDE_BIN, CLAUDE_TIMEOUT,
     TG_CHUNK, SESSION_TTL_HOURS, VOICE_PORT, SHORTCUT_TOKEN_FILE, VOICE_CERT,
+    INJECT_PORT, INJECT_TOKEN, INJECT_TOKEN_FILE, PULT_PORT, PULT_HOST, PULT_URL,
     VOICE_KEY, EDGE_TTS_BIN, TTS_VOICE_DEFAULT, VOICE_REPLY_MAX_CHARS,
     ZVUKOGRAM_API, ZVUKOGRAM_KEY_PATH, ZVUKOGRAM_EMAIL_PATH, TTS_MARKER_RE,
     VOICE_TAG_MAP, log, read_token, read_shortcut_token, TOKEN, SHORTCUT_TOKEN,
@@ -68,7 +70,7 @@ from botctx import (  # noqa: F401  (сквозной ре-экспорт для
     _STOP_FLAGS, _STOP_POSTED, _STREAM_PARTIAL, _TURN_LOCKS, _TURN_LOCKS_GUARD,
     _INTERRUPT_FLAGS, _INTERRUPTED_SENTINEL, _get_turn_lock, _album_lock,
     _album_buffers, _burst_lock, _burst_buffers, _brief_active_msg,
-    _brief_level
+    _brief_level, carry, ckey, in_topic, msg_topic,
 )
 
 # Локальный Whisper убран 10.08.2026 — расшифровка целиком облачная:
@@ -91,6 +93,7 @@ from prompt import (  # noqa: F401  (сквозной ре-экспорт для
 
 
 
+import pult  # 08.10.2026: пульт движка, модели и усилия
 from menu import set_turn_runner
 from menu import (  # noqa: F401  (сквозной ре-экспорт для остатка ядра)
     _BOT_INTERNAL_COMMANDS, _discover_skill_commands, _skill_cmds,
@@ -251,6 +254,14 @@ from intake import (  # noqa: F401  (сквозной ре-экспорт для
 
 
 def handle_callback(cq):
+    """Inline-button tap. Кнопка живёт в теме — и всё, что она делает (СТОП, ход,
+    меню), идёт в эту тему (08.10.2026)."""
+    msg = cq.get("message") or {}
+    with in_topic((msg.get("chat") or {}).get("id"), msg_topic(msg)):
+        _handle_callback(cq)
+
+
+def _handle_callback(cq):
     """Inline-button tap. Currently only the ✅ confirm button is wired (callback_data='ok').
     Acks the query, removes the keyboard, and replays 'да' into the user's session."""
     cq_id = cq.get("id")
@@ -274,31 +285,33 @@ def handle_callback(cq):
         except Exception as e:
             log(f"strip clicked-msg keyboard: {e}")
         # Forget tracking for this message — it no longer has buttons.
-        if _brief_active_msg.get(chat_id) == msg_id:
-            _brief_active_msg.pop(chat_id, None)
+        if _brief_active_msg.get(ckey(chat_id)) == msg_id:
+            _brief_active_msg.pop(ckey(chat_id), None)
     if data == "stop":
+        # 08.10.2026: ключ беседы — СТОП в одной теме не трогает ход соседней
+        ck = ckey(chat_id)
         proc = None
         with _RUNNING_PROCS_LOCK:
-            proc = _RUNNING_PROCS.pop(chat_id, None)
+            proc = _RUNNING_PROCS.pop(ck, None)
         if proc is not None:
-            _STOP_FLAGS[chat_id] = True
+            _STOP_FLAGS[ck] = True
             # 2026-07-06 (по просьбе хозяина): гасим стрим-черновик МГНОВЕННО, постя финальное
             # РЕАЛЬНОЕ сообщение. Пустой текст черновик НЕ удаляет — рисует плейсхолдер
             # «Thinking…» на ~10с и держит поле ввода (Deep Research, журнал 2026-07-06).
             # Реальное сообщение гасит черновик и освобождает ввод сразу. Партиал берём
             # из _STREAM_PARTIAL; двойной пост из хода гасим флагом _STOP_POSTED.
             try:
-                _pl = _STREAM_PARTIAL.get(chat_id)
+                _pl = _STREAM_PARTIAL.get(ck)
                 _partial = ("".join(_pl)).strip() if _pl else ""
                 _msg = (_partial + "\n\n🛑 остановлено по кнопке.") if _partial \
                     else "🛑 остановлено по кнопке (ответ ещё не начался)."
                 api("sendMessage", chat_id=chat_id, text=_msg[:TG_CHUNK])
-                _STOP_POSTED[chat_id] = True
+                _STOP_POSTED[ck] = True
             except Exception:
                 pass
             rc_stop = None
             with _RESIDENT_LOCK:
-                rc_stop = _RESIDENT.get(chat_id)
+                rc_stop = _RESIDENT.get(ck)
             # Мягкое прерывание (как в десктопе): процесс остаётся жив, без
             # холодного старта на следующем ходе. Страховка: если за 4с ход не
             # завершился (процесс реально завис, не читает ввод) — добиваем kill().
@@ -316,7 +329,7 @@ def handle_callback(cq):
                 except Exception:
                     pass
 
-            def _stop_escalate(p=proc, cid=chat_id):
+            def _stop_escalate(p=proc, cid=ck):
                 time.sleep(4.0)
                 if _STOP_FLAGS.get(cid):
                     try:
@@ -330,14 +343,31 @@ def handle_callback(cq):
         else:
             log(f"⏹ STOP by uid={uid} in chat={chat_id} — no running proc")
         return
+    if data.startswith("pult:"):
+        # 08.10.2026: пульт движка, модели и усилия (pult.py). Хода модели не заводит,
+        # перерисовывает то же сообщение (клавиатуру выше уже сняли, ставим заново).
+        try:
+            if pult.apply(data):
+                _pt, _pk = pult.render()
+                api("editMessageText", chat_id=chat_id, message_id=msg_id, text=_pt,
+                    reply_markup=json.dumps(_pk))
+            else:
+                _eng, _m, _e = pult.state()
+                api("editMessageText", chat_id=chat_id, message_id=msg_id,
+                    text=f"🎛 {pult.ENGINE_RU[_eng]}, {pult.model_label(_eng, _m)}, "
+                         f"усилие {pult.EFFORT_RU.get(_e, _e)}. Пульт: /model")
+        except Exception as e:
+            log(f"pult callback error: {e}")
+            api("sendMessage", chat_id=chat_id, text=f"⚠️ Пульт не сработал: {e}")
+        return
     if data == "aai:no":
-        drop_pending_aai(uid)
+        drop_pending_aai(uid, chat_id)
         api("sendMessage", chat_id=chat_id, text="Отменил, в AssemblyAI не отправляю.")
         return
     if data == "aai:ok":
         # Расшифровка длинной записи идёт минутами — уводим в отдельный поток,
         # чтобы опрос обновлений Telegram не залипал.
-        threading.Thread(target=run_pending_aai, args=(uid, chat_id), daemon=True).start()
+        threading.Thread(target=carry(run_pending_aai), args=(uid, chat_id), daemon=True).start()
         return
     if data == "ok":
         reply_text = "да"
@@ -390,7 +420,8 @@ class VoiceHandler(http.server.BaseHTTPRequestHandler):
                    delivers the prompt into the resident session so the brief is a
                    real remembered turn instead of a one-shot headless claude.
       Headers: X-Auth-Token: <SHORTCUT_TOKEN>
-      Body:    {"text": "..."}
+      Body:    {"text": "...", "chat_id"?: int, "label"?: str, "thread_id"?: int}
+               thread_id (08.10.2026) — тема чата, куда вернуть ход; нет = общий вид.
     Response: {"ok": true, "reply": "..."} (200) or error (4xx/5xx).
 
     Side effects: the assistant reply is posted into the TG private chat by
@@ -426,11 +457,13 @@ class VoiceHandler(http.server.BaseHTTPRequestHandler):
         query = urllib.parse.parse_qs(parsed.query)
         fmt_text = query.get("fmt", [""])[0] == "text"
 
-        if parsed.path not in ("/voice", "/inject"):
+        allowed_paths = ("/inject",) if self.local_inject else ("/voice", "/inject")
+        if parsed.path not in allowed_paths:
             self._reply(fmt_text, 404, False, "not found")
             return
         token = self.headers.get("X-Auth-Token", "")
-        if not SHORTCUT_TOKEN or token != SHORTCUT_TOKEN:
+        want = INJECT_TOKEN if self.local_inject else SHORTCUT_TOKEN
+        if not want or token != want:
             self._reply(fmt_text, 401, False, "unauthorized")
             return
         try:
@@ -451,6 +484,33 @@ class VoiceHandler(http.server.BaseHTTPRequestHandler):
             return
         chat_id = uid  # private TG chat: chat_id == user_id (owner = первая строка allowlist)
 
+        # 24.09.2026: таймер бота (tools/bot-timer.py) вбрасывает ход в нужный чат.
+        # Группа — только из profile.inject_chats; личка — только того, кто в allowlist.
+        # Группа ведёт одну сессию на чат (turn.py), поэтому ход ложится в живую нить,
+        # и бот потом помнит, что сам это написал.
+        label = (data.get("label") or "").strip()[:80]
+        want_chat = data.get("chat_id")
+        if want_chat is not None:
+            try:
+                want_chat = int(want_chat)
+            except (TypeError, ValueError):
+                self._reply(fmt_text, 400, False, "bad chat_id")
+                return
+            if want_chat < 0:
+                if str(want_chat) not in (PROFILE.get("inject_chats") or {}):
+                    self._reply(fmt_text, 403, False, "chat not in inject_chats")
+                    return
+            elif want_chat not in load_allowlist():
+                self._reply(fmt_text, 403, False, "user not in allowlist")
+                return
+            else:
+                uid = want_chat
+            chat_id = want_chat
+        if label or chat_id < 0:
+            # как у живого сообщения группы: шапка «[от …]», иначе персона не узнает группу
+            who = f"⏰ Таймер «{label}»" if label else "⏰ Таймер"
+            text = f"[от {who} (uid={uid})]: {text}" if chat_id < 0 else f"[{who}] {text}"
+
         # /voice = spoken user message → echo "🎙 …" so chat mirrors a normal
         # exchange. /inject = scheduled brief prompt → deliver straight into the
         # resident session WITHOUT echoing the prompt, so the brief becomes a real
@@ -462,8 +522,16 @@ class VoiceHandler(http.server.BaseHTTPRequestHandler):
         else:
             src = "scheduled"
 
+        # 08.10.2026: таймер, поставленный из темы, приносит её номер — ход идёт туда.
+        # Старая карточка без темы = общий вид, как было.
         try:
-            reply = process_user_text(uid, chat_id, text, source=src)
+            thread_id = int(data.get("thread_id") or 0) or None
+        except (TypeError, ValueError):
+            self._reply(fmt_text, 400, False, "bad thread_id")
+            return
+        try:
+            with in_topic(chat_id, thread_id):
+                reply = process_user_text(uid, chat_id, text, source=src)
         except Exception as e:
             log(f"{parsed.path} endpoint error: {e}")
             self._reply(fmt_text, 500, False, str(e))
@@ -471,8 +539,15 @@ class VoiceHandler(http.server.BaseHTTPRequestHandler):
 
         self._reply(fmt_text, 200, True, reply)
 
+    local_inject = False
+
     def log_message(self, fmt, *args):
         log(f"voice-http: {self.address_string()} {fmt % args}")
+
+
+class LocalInjectHandler(VoiceHandler):
+    """Только /inject, только 127.0.0.1, свой ключ inject-token (24.09.2026)."""
+    local_inject = True
 
 
 class _TLSThreadingHTTPServer(http.server.ThreadingHTTPServer):
@@ -514,6 +589,85 @@ def start_voice_server():
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
 
 
+def start_inject_server():
+    """Дверь для таймеров бота: 127.0.0.1, без TLS, наружу не торчит."""
+    if INJECT_PORT is None:
+        return
+    if not INJECT_TOKEN:
+        log("inject endpoint disabled (нет inject-token в каталоге секретов)")
+        return
+    try:
+        httpd = http.server.ThreadingHTTPServer(("127.0.0.1", int(INJECT_PORT)), LocalInjectHandler)
+    except Exception as e:
+        log(f"inject endpoint bind failed on 127.0.0.1:{INJECT_PORT}: {e}")
+        return
+    log(f"inject endpoint: http://127.0.0.1:{INJECT_PORT}/inject (таймеры бота)")
+    # модель и её tools/bot-timer.py узнают дверь из окружения, в промпт ключ не кладём
+    os.environ["BOT_INJECT_PORT"] = str(INJECT_PORT)
+    os.environ["BOT_INJECT_TOKEN_FILE"] = INJECT_TOKEN_FILE
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+
+
+class PultHandler(http.server.BaseHTTPRequestHandler):
+    """Мини-приложение пульта (08.10.2026): GET отдаёт страницу, POST …/api принимает
+    initData от Telegram и действие. Вход проверяет подпись initData токеном бота
+    и allowlist, дальше та же запись, что у кнопок /model (pult.apply)."""
+
+    def _out(self, code, body, ctype):
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        path = urllib.parse.urlparse(self.path).path
+        if path.endswith("/api"):
+            self._out(405, b"POST only", "text/plain; charset=utf-8")
+            return
+        self._out(200, pult.PAGE_HTML.encode(), "text/html; charset=utf-8")
+
+    def do_POST(self):
+        path = urllib.parse.urlparse(self.path).path
+        if not path.endswith("/api"):
+            self._out(404, b"not found", "text/plain; charset=utf-8")
+            return
+        try:
+            n = int(self.headers.get("Content-Length", 0) or 0)
+            if n > 16384:
+                raise ValueError("too big")
+            body = json.loads(self.rfile.read(n) or b"{}")
+            if not isinstance(body, dict):
+                raise ValueError("not an object")
+            code, payload = pult.webapp_api(body, TOKEN, load_allowlist())
+        except Exception as e:
+            code, payload = 400, {"ok": False, "error": f"bad request: {e}"}
+        self._out(code, json.dumps(payload, ensure_ascii=False).encode(),
+                  "application/json; charset=utf-8")
+
+    def log_message(self, fmt, *args):
+        pass  # запросы страницы журнал не засоряют, действия пишет pult.webapp_api
+
+
+def start_pult_server():
+    """Сервер мини-приложения и кнопка у поля ввода. Нет pult_port или pult_url = ничего."""
+    if PULT_PORT is None or not PULT_URL:
+        return
+    try:
+        httpd = http.server.ThreadingHTTPServer((PULT_HOST, int(PULT_PORT)), PultHandler)
+    except Exception as e:
+        log(f"pult endpoint bind failed on {PULT_HOST}:{PULT_PORT}: {e}")
+        return
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    log(f"pult endpoint: http://{PULT_HOST}:{PULT_PORT} → {PULT_URL}")
+    try:
+        res = api("setChatMenuButton", menu_button=json.dumps(
+            {"type": "web_app", "text": "Пульт", "web_app": {"url": PULT_URL}}))
+        log(f"setChatMenuButton: {res}")
+    except Exception as e:
+        log(f"setChatMenuButton error: {e}")
+
 
 
 def main():
@@ -529,6 +683,8 @@ def main():
     setup_bot_menu()
     cleanup_voice_archive()
     start_voice_server()
+    start_inject_server()
+    start_pult_server()
     # 2026-08-27: гасит резидентов, простоявших дольше resident_idle_sec.
     # Без него процесс `claude` в чате живёт до перезапуска юнита и течёт.
     start_resident_reaper()
@@ -557,9 +713,10 @@ def main():
                         except Exception as e:
                             log(f"handle_message error: {e}")
                             try:
-                                api("sendMessage",
-                                    chat_id=m["chat"]["id"],
-                                    text=f"⚠️ Внутренняя ошибка: {e}")
+                                with in_topic(m["chat"]["id"], msg_topic(m)):
+                                    api("sendMessage",
+                                        chat_id=m["chat"]["id"],
+                                        text=f"⚠️ Внутренняя ошибка: {e}")
                             except Exception:
                                 pass
                     threading.Thread(target=_dispatch, daemon=True).start()

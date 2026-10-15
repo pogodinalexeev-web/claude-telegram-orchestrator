@@ -9,7 +9,7 @@
 
 1. Имя пользователя берётся ТОЛЬКО из системы (`pwd.getpwuid(os.geteuid())`).
    Не из аргумента командной строки, не из сообщения, не из переменной. Иначе
-   бот Beta сможет прочитать профиль Хозяина — а это чужой токен, чужой vault и
+   бот одного хозяина сможет прочитать профиль другого — а это чужой токен, чужой vault и
    чужой хозяин в групповом чате.
 2. Лишнее поле в json → падение с именем поля (опечатка не должна тихо
    игнорироваться). Нет обязательного поля → падение с понятным текстом.
@@ -73,15 +73,15 @@ class Profile:
     vault: str
 
     # --- как звать хозяина в тексте промпта ---
-    # Ядро одно на всех, а обращается оно к конкретному человеку: «Owner тап —
-    # тебе придёт подпись», «чтобы Owner увидел картинку». Раньше имя было
+    # Ядро одно на всех, а обращается оно к конкретному человеку: «Хозяин тап —
+    # тебе придёт подпись», «чтобы хозяин увидел картинку». Раньше имя было
     # вписано в текст ядра латиницей и новому хозяину бот говорил чужое имя.
     # Три поля, потому что русский язык склоняется: именительный, родительный,
     # дательный. Не указаны — берётся owner_name во всех трёх (грамматически
     # шершаво, зато никогда не чужое имя).
-    owner_alias: str = ""       # ⊘ owner_name  — «Owner», «Beta»
-    owner_alias_gen: str = ""   # ⊘ owner_alias — «Owner'а», «Beta»
-    owner_alias_dat: str = ""   # ⊘ owner_alias — «Owner'у», «Beta»
+    owner_alias: str = ""       # ⊘ owner_name  — «Хозяин», «Имя»
+    owner_alias_gen: str = ""   # ⊘ owner_alias — «Хозяина», «Имени»
+    owner_alias_dat: str = ""   # ⊘ owner_alias — «Хозяину», «Имени»
 
     # --- часовой пояс, необязательные украшения фразы про «завтра в 14» ---
     tz_short: str = ""          # «MSK»
@@ -93,7 +93,7 @@ class Profile:
 
     # --- примеры «напиши такому-то» в блоке отправки сообщений ---
     # Ядро объясняет модели, как выглядит просьба отправить сообщение, и делает
-    # это на живых примерах («напиши Alpha привет»). Имена друзей — личные
+    # это на живых примерах («напиши <имени> привет»). Имена друзей — личные
     # данные хозяина, поэтому список приходит из профиля. Пусто — в промпте
     # останется нейтральное «<имя>», никто чужой не назван.
     contact_examples: list = field(default_factory=list)
@@ -147,12 +147,40 @@ class Profile:
     # На этом сервере он общий для всех ботов, поэтому значение по умолчанию есть.
     local_api_container: str = "tg-local-api"
     voice_port: object = None       # int или None (не поднимать сервер голоса)
+    # 24.09.2026, слово хозяина «таймер падает в живую нить бота»: дверь /inject только на
+    # 127.0.0.1 без TLS, для таймеров самого бота (tools/bot-timer.py). None = не поднимать.
+    inject_port: object = None
+    # Группы, куда таймер вправе вбросить ход: {"<chat_id>": "название"}. Личка любого
+    # из allowlist разрешена и без списка.
+    inject_chats: dict = field(default_factory=dict)
+    # 08.10.2026, слово хозяина «супер отдельная кнопка, которая открывает мини-ап и никаких
+    # слэш-команд»: пульт движка, модели и усилия мини-приложением Telegram. Сервер пульта
+    # слушает pult_host:pult_port, наружу его выводит обратный прокси по адресу pult_url,
+    # кнопка у поля ввода ставится на этот адрес. None/пусто = пульта-кнопки нет.
+    pult_port: object = None
+    pult_host: str = "172.18.0.1"
+    pult_url: str = ""
     # Сколько секунд простоя терпит резидентный `claude` в чате, прежде чем жнец
     # (claude_run._reap_idle_residents) его закроет. Следующее сообщение поднимет
     # процесс заново с --resume: sid лежит в sessions.json, история цела.
     # 0 = не жать вовсе (процесс живёт до перезапуска юнита — так было до 27.08.2026,
     # и это стоило памяти: сессия сама не истекает, а память по ходу растёт).
     resident_idle_sec: int = 600
+    # 08.10.2026, темы: потолок одновременно живых резидентов на бота. Лишний гасится
+    # по давности последнего хода, беседа продолжается с --resume. 0 = без потолка.
+    max_residents: int = 4
+    # 23.09.2026: в группе даже хозяин зовёт бота только @упоминанием или ответом (бот отдела)
+    group_mention_only: bool = False
+    ctx_header: bool = True         # 23.09.2026: шапка «(ctx 42.5k)» над каждым ответом; для ботов отдела выключается
+    dm_uid_prefix: bool = False     # 23.09.2026: в личке шапка [личка: Имя (uid=…)] перед текстом; для ботов отдела
+    group_status_panel: bool = False  # 23.09.2026: панель «принял, думаю…» со СТОП и в группах (бот отдела один в группе, дублей от чужих ботов нет)
+    status_panel: object = True      # 24.09.2026: панель «принял, думаю…» со СТОП и поток текста в ней; False = без панели, ответ одним куском; "compact" = панель со СТОП и свёрнутыми вызовами, без потока текста (бот отдела, слово хозяина 16:15)
+    spin_emoji_id: str = ""          # 09.10.2026: живая звёздочка Claude на панели (custom emoji из своего набора эмодзи); первый номер звёздочка, дальше крабы; раз в 30 с жребий, все значки на равных; пусто = пульс обычными эмодзи. Ставить только боту, чей владелец с Premium
+    group_reply_counts: bool = True    # 23.09.2026: ответ на сообщение бота в группе = обращение; у бота отдела False, зовут только @именем
+    group_allowlist_strict: bool = False  # 23.09.2026: в группе чужой uid не пускать даже по @упоминанию (бот отдела)
+    group_context_lines: int = 0      # 23.09.2026: сколько последних сообщений группы подкладывать модели при обращении (0 = не вести журнал)
+    dig_button: bool = True          # 23.09.2026: кнопка лупы 🔎 под ответом (маркер __DIG__ и авто-лупа на длинных ответах); у бота отдела выключена
+    rules_update_notice: bool = True  # 24.09.2026: сообщение «🔄 Правила обновились» в чат; у ботов отдела выключено
     router_unit: object = None      # имя юнита для метрики, None → не собирать
     xdg_runtime_dir: str = ""       # ⊘ /run/user/<uid системного пользователя>
     # Куда синхронизируется vault. Пусто = определить по самому хранилищу
@@ -176,6 +204,9 @@ class Profile:
     menu_categories: list = field(default_factory=list)     # [(slug, name, [kids])]
     menu_subprojects: dict = field(default_factory=dict)
     menu_hidden_at_top: set = field(default_factory=set)
+    # Кнопочное меню (/menu, клавиатура задач/идей/inbox) и список команд «/».
+    # False: /menu отвечает одной строкой, в Telegram регистрируется только /new.
+    menu_enabled: bool = True
 
     # --- служебное, в json не пишется ---
     user: str = ""
@@ -459,12 +490,13 @@ _TYPES = {
     "owner_uid": int, "tz_offset_hours": int,
     "owner_name": str, "owner_alias": str, "owner_alias_gen": str,
     "owner_alias_dat": str, "bot_username": str, "tz_label": str, "home": str, "vault": str,
-    "tz_iana": str, "local_api_container": str,
-    "git_remote": str, "git_branch": str,
+    "tz_iana": str, "local_api_container": str, "pult_host": str, "pult_url": str,
+    "git_remote": str, "git_branch": str, "max_residents": int,
     "architecture_doc": str,
     "ext_dir": str,
-    "root_method": str,
-    "features": dict, "menu_subprojects": dict,
+    "root_method": str, "menu_enabled": bool,
+    "group_reply_counts": bool, "group_allowlist_strict": bool, "group_context_lines": int, "dig_button": bool, "rules_update_notice": bool,
+    "features": dict, "menu_subprojects": dict, "inject_chats": dict,
     "neighbor_bots": list, "menu_projects": list, "menu_categories": list,
     "menu_hidden_at_top": list, "contact_examples": list,
 }
@@ -478,6 +510,10 @@ def _typecheck(raw):
             )
     if "voice_port" in raw and raw["voice_port"] is not None and not isinstance(raw["voice_port"], int):
         raise ProfileError("поле 'voice_port': ожидалось число или null")
+    if "inject_port" in raw and raw["inject_port"] is not None and not isinstance(raw["inject_port"], int):
+        raise ProfileError("поле 'inject_port': ожидалось число или null")
+    if "pult_port" in raw and raw["pult_port"] is not None and not isinstance(raw["pult_port"], int):
+        raise ProfileError("поле 'pult_port': ожидалось число или null")
 
 
 if __name__ == "__main__":   # ручная проверка: python3 botprofile.py

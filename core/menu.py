@@ -19,7 +19,7 @@ import urllib.request
 from pathlib import Path
 
 from botctx import (
-    API, PROFILE, VAULT, log, _MENU_ROW, _brief_active_msg, _brief_level,
+    API, PROFILE, VAULT, log, _MENU_ROW, _brief_active_msg, _brief_level, ckey,
 )
 from tgapi import api, md_to_html, send_chunked, _strip_active_keyboard
 
@@ -123,7 +123,7 @@ _BRIEF_PROJ_BY_SLUG = {slug: (name, d) for slug, name, d in _BRIEF_PROJECTS}
 
 # Categories shown at top of "projects" menu. Slug → (display, [project_slugs]).
 # Projects NOT listed in any category render as flat top-level entries.
-# multi is intentionally hidden at top level — appears only inside course's menu.
+# multi is intentionally hidden at top level — appears only inside bayram's menu.
 _BRIEF_CATEGORIES = PROFILE["menu_categories"]
 _BRIEF_CAT_BY_SLUG = {slug: (name, kids) for slug, name, kids in _BRIEF_CATEGORIES}
 _HIDDEN_AT_TOP = PROFILE["menu_hidden_at_top"]
@@ -288,7 +288,7 @@ def _kb_project(slug):
         rows.append(row)
     if os.path.exists(os.path.join(VAULT, rel, "manual.md")):
         rows.append([{"text": "📂 manual", "callback_data": f"f:m:{slug}"}])
-    # Drill-in to subprojects (e.g. Мульти-Агент under Курс Курс).
+    # Drill-in to subprojects (e.g. Мульти-Агент under Курс Байрама).
     dash = _parse_status_dashboard()
     for child in _BRIEF_SUBPROJECTS.get(slug, []):
         centry = _BRIEF_PROJ_BY_SLUG.get(child)
@@ -340,7 +340,7 @@ def _describe_level(level):
 
 def _nav_state_line(chat_id):
     """Return '[NAV_STATE] ...' prefix line or empty string."""
-    level = _brief_level.get(chat_id)
+    level = _brief_level.get(ckey(chat_id))
     desc = _describe_level(level) if level else None
     if not desc:
         return ""
@@ -358,7 +358,7 @@ def _send_brief(chat_id, text, kb):
         log(f"_send_brief: {e}")
         return
     if res.get("ok"):
-        _brief_active_msg[chat_id] = res["result"]["message_id"]
+        _brief_active_msg[ckey(chat_id)] = res["result"]["message_id"]
 
 
 def _level_text_kb(level):
@@ -395,9 +395,9 @@ def handle_brief_nav_callback(chat_id, msg_id, data):
         return
     # If the clicked button was on the currently-active message, also treat it
     # as the active one (sync state in case external script sent the first menu).
-    if msg_id and chat_id not in _brief_active_msg:
-        _brief_active_msg[chat_id] = msg_id
-    _brief_level[chat_id] = level
+    if msg_id and ckey(chat_id) not in _brief_active_msg:
+        _brief_active_msg[ckey(chat_id)] = msg_id
+    _brief_level[ckey(chat_id)] = level
     text, kb = _level_text_kb(level)
     _send_brief(chat_id, text, kb)
 
@@ -450,8 +450,8 @@ def handle_brief_file_callback(chat_id, uid, data):
     else:
         back_btn = {"text": "⬅ назад", "callback_data": "nav:root"}
     # Track that the user is now LOOKING AT the file, not at a menu level.
-    _brief_level[chat_id] = ("file", rel_path)
-    nav_rows = [[back_btn, _MENU_ROW[0]]]
+    _brief_level[ckey(chat_id)] = ("file", rel_path)
+    nav_rows = [[back_btn, _MENU_ROW[0]]] if PROFILE.get("menu_enabled", True) else [[back_btn]]
     full = os.path.join(VAULT, rel_path)
     try:
         with open(full, encoding="utf-8") as f:
@@ -536,6 +536,8 @@ def _drop_empty_sections(text):
 def setup_bot_menu():
     """Register slash-command menu in TG client (the '/' button)."""
     cmds = [{"command": c, "description": d} for c, d in BOT_MENU_COMMANDS]
+    if not PROFILE.get("menu_enabled", True):
+        cmds = [x for x in cmds if x["command"] in ("new", "compact")]
     payload = json.dumps({"commands": cmds}).encode()
     req = urllib.request.Request(
         f"{API}/setMyCommands",

@@ -17,6 +17,7 @@ import shutil
 import subprocess
 import tempfile
 import time
+import urllib.error
 import urllib.request
 import uuid
 from datetime import datetime, timedelta
@@ -26,9 +27,9 @@ from botctx import (
     API, ASSEMBLYAI_KEY_FILE, EDGE_TTS_BIN, GROQ_KEY_FILE, GROQ_MODEL, MSK,
     NATIVE_MIN_SEC, PROFILE, TTS_VOICE_DEFAULT, VOICE_ARCHIVE_DIR,
     VOICE_ARCHIVE_TTL_DAYS, VOICE_DIARIZE_SEC, VOICE_LONG_THRESHOLD_SEC, VOICE_REPLY_MAX_CHARS,
-    ZVUKOGRAM_API, ZVUKOGRAM_EMAIL_PATH, ZVUKOGRAM_KEY_PATH, log,
+    ZVUKOGRAM_API, ZVUKOGRAM_EMAIL_PATH, ZVUKOGRAM_KEY_PATH, log, _PINNED, topic_of,
 )
-from tgapi import md_to_html, strip_html
+from tgapi import http_error_desc, is_topic_error, md_to_html, strip_html, thread_form_part
 from media import download_file_to
 
 
@@ -363,17 +364,19 @@ def _synth_voice_ogg(text, out_ogg, voice=None):
         except Exception: pass
 
 
-def api_send_voice(chat_id, ogg_path):
-    """Multipart sendVoice."""
+def api_send_voice(chat_id, ogg_path, thread_id=_PINNED):
+    """Multipart sendVoice. В ходе из темы голос уходит в неё (08.10.2026)."""
     import uuid
+    tid = topic_of(chat_id) if thread_id is _PINNED else thread_id
     boundary = uuid.uuid4().hex
     with open(ogg_path, "rb") as f:
         audio = f.read()
     head = (
-        f"--{boundary}\r\nContent-Disposition: form-data; name=\"chat_id\"\r\n\r\n{chat_id}\r\n"
-        f"--{boundary}\r\nContent-Disposition: form-data; name=\"voice\"; filename=\"reply.ogg\"\r\n"
-        f"Content-Type: audio/ogg\r\n\r\n"
-    ).encode()
+        f"--{boundary}\r\nContent-Disposition: form-data; name=\"chat_id\"\r\n\r\n{chat_id}\r\n".encode()
+        + thread_form_part(boundary, chat_id, tid)
+        + f"--{boundary}\r\nContent-Disposition: form-data; name=\"voice\"; filename=\"reply.ogg\"\r\n"
+        f"Content-Type: audio/ogg\r\n\r\n".encode()
+    )
     tail = f"\r\n--{boundary}--\r\n".encode()
     body = head + audio + tail
     req = urllib.request.Request(
@@ -384,6 +387,13 @@ def api_send_voice(chat_id, ogg_path):
     try:
         with urllib.request.urlopen(req, timeout=120) as r:
             return json.load(r)
+    except urllib.error.HTTPError as e:
+        desc = http_error_desc(e)
+        if tid and is_topic_error(desc):
+            log(f"sendVoice: тема {tid} не принимает, шлю в общий вид")
+            return api_send_voice(chat_id, ogg_path, thread_id=None)
+        log(f"sendVoice error: {desc}")
+        return {"ok": False, "description": desc}
     except Exception as e:
         log(f"sendVoice error: {e}")
         return {"ok": False}

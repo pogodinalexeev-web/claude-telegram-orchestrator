@@ -24,6 +24,18 @@ import threading
 import time
 from typing import Iterator, Optional
 
+# Общее ядро скиллов (08.10.2026, слово хозяина стенда: «общее ядро скиллов, которые всем
+# подгружаются… после перезапуска бота»). Папка-дополнение Claude Code, одна на
+# всех ботов сервера; что лежит в её skills/, видно каждому боту как lab-skills:<имя>.
+# Нет папки или её манифеста — флага нет, бот живёт как жил.
+PLUGIN_DIRS_DEFAULT = "/opt/lab-skills"
+
+
+def shared_plugin_dirs() -> list:
+    raw = os.environ.get("TGBOT_PLUGIN_DIRS", PLUGIN_DIRS_DEFAULT)
+    return [d for d in raw.split(":")
+            if d and os.path.isfile(os.path.join(d, ".claude-plugin", "plugin.json"))]
+
 
 class ResidentClaude:
     def __init__(
@@ -37,6 +49,7 @@ class ResidentClaude:
         disallowed_tools: str = "",
         permission_mode: str = "bypassPermissions",
         effort: str = "medium",
+        name: Optional[str] = None,
     ):
         self.claude_bin = claude_bin
         self.system_prompt = system_prompt
@@ -47,6 +60,9 @@ class ResidentClaude:
         self.env_extra = env_extra or {}
         self.disallowed_tools = disallowed_tools
         self.permission_mode = permission_mode
+        # 08.10.2026: имя беседы в списке Claude Code (`claude --name`, в jsonl запись
+        # custom-title). Ставится только резиденту темы, у прочих флага нет.
+        self.name = name
 
         self.proc: Optional[subprocess.Popen] = None
         self.session_id: Optional[str] = resume_sid
@@ -63,6 +79,7 @@ class ResidentClaude:
         self._consumer_active = False
         self._turn_open = False          # читатель сейчас внутри ничейного хода
         self._stray_buf: list = []
+        self._results_left = 0           # сколько result ещё ждёт консюмер (хвост ничейного + свой)
         self._last_line_at = time.time()
         self.on_stray = None             # callback(list_of_events) — ставит бот
 
@@ -82,13 +99,20 @@ class ResidentClaude:
             cmd += ["--disallowedTools", self.disallowed_tools]
         if self.resume_sid:
             cmd += ["--resume", self.resume_sid]
+        if getattr(self, "name", None):
+            cmd += ["--name", self.name]
+        for d in shared_plugin_dirs():
+            cmd += ["--plugin-dir", d]
         return cmd
 
     def start(self) -> None:
         """Spawn the Popen. Не блокируется на init-событие — claude молчит на stdout,
         пока не получит первый user-message в stdin. init/session_id придут потоком
         в первый send_and_collect()."""
-        env = {**os.environ, **self.env_extra}
+        # Метка для крюков внутри claude: git-синхру ведёт ядро бота (pull до хода,
+        # commit+push после), sync-pull.sh при этой метке выходит сразу — иначе на
+        # каждый ход шёл двойной git (замер 28.08: крюк 7с под срезанной квотой).
+        env = {**os.environ, **self.env_extra, "CLAUDE_TG_BOT": "1"}
         self.proc = subprocess.Popen(
             self._build_cmd(),
             stdin=subprocess.PIPE,
@@ -128,6 +152,15 @@ class ResidentClaude:
                 self.session_id = ev.get("session_id") or self.session_id
             if self._consumer_active and self._q is not None:
                 self._q.put(ev)
+                # 25.09.2026, мягкий досыл: сообщение, досланное во время финального
+                # текста, claude ставит СЛЕДУЮЩИМ ходом сразу за result. Консюмер гасит
+                # флаг только когда генератор закроют, и первые события того хода
+                # проваливались в очередь мёртвого консюмера. Теперь читатель сам
+                # отключает консюмера на его последнем result: дальше всё ничейное.
+                if ev.get("type") == "result":
+                    self._results_left -= 1
+                    if self._results_left <= 0:
+                        self._consumer_active = False
             else:
                 # 25.09.2026: ход считается начатым только по событию модели. Раньше
                 # флаг ставило ЛЮБОЕ событие между ходами (служебный шум без result),
@@ -187,11 +220,13 @@ class ResidentClaude:
             stray_prefix, self._stray_buf = self._stray_buf, []
         else:
             self._stray_buf = []   # служебный шум между ходами, ход не открывал
+        self._results_left = pending_stray + 1
         self._consumer_active = True
 
         msg = {"type": "user", "message": {"role": "user", "content": text}}
-        self.proc.stdin.write(json.dumps(msg, ensure_ascii=False) + "\n")
-        self.proc.stdin.flush()
+        with self._lock:
+            self.proc.stdin.write(json.dumps(msg, ensure_ascii=False) + "\n")
+            self.proc.stdin.flush()
 
         t0 = time.time()
         # Сброс отметки тишины (26.08.2026, инцидент «дневной брифинг умер за 3 минуты»):
@@ -253,6 +288,23 @@ class ResidentClaude:
             stop_watchdog.set()
             self._consumer_active = False
             self._q = None
+
+    def inject(self, text: str) -> bool:
+        """Мягкий досыл (25.09.2026): дописать сообщение хозяина в ИДУЩИЙ ход, не прерывая.
+        Замер на Claude Code 2.1.280: досланное во время работы инструмента claude
+        подхватывает на ближайшем шаге и вшивает в тот же ответ (один result);
+        досланное во время финального текста встаёт следующим ходом, который
+        читатель отдаёт как ничейный через on_stray. True, если записано в stdin."""
+        if not self.is_alive():
+            return False
+        msg = {"type": "user", "message": {"role": "user", "content": text}}
+        with self._lock:
+            try:
+                self.proc.stdin.write(json.dumps(msg, ensure_ascii=False) + "\n")
+                self.proc.stdin.flush()
+                return True
+            except Exception:
+                return False
 
     def interrupt(self) -> None:
         """Послать protocol-interrupt (control_request) текущему ходу.

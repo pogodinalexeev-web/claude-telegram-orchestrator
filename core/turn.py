@@ -24,8 +24,10 @@ from botctx import (
     MSK, PENDING_CAL_TTL_SEC, PENDING_SEND_TTL_SEC, PROFILE,
     VAULT, log,
     _INTERRUPTED_SENTINEL, _RESIDENT, _RESIDENT_LOCK, _STOP_FLAGS, _STOP_POSTED,
+    _FOLLOWUP_GATES, carry, ckey, note_topic_session, tkey, topic_of,
 )
 import botext
+import engine
 from claude_run import call_claude
 from markers import (
     auto_dig, clear_pending_cal, clear_pending_send, detect_choices,
@@ -37,17 +39,18 @@ from markers import (
     set_pending_cal, set_pending_send,
 )
 from media import (
-    extract_and_send_documents, extract_and_send_images,
+    extract_and_send_documents, extract_and_send_images, pop_doc_failures,
     process_attachment_markers,
 )
 from menu import _nav_state_line
 from tgapi import (
+    SAVE_FOOTER_HEAD,
     TypingPulser, api, send_chunked, strip_html, tg_resolve_peer, tg_send_now,
     _oneshot,
 )
 from vaultio import (
     append_chatlog, append_tasks_from_markers, append_to_inbox_raw, get_msg_count,
-    get_session, get_total_tokens, git_sync, rag_reindex,
+    get_session, get_total_tokens, git_sync, rag_reindex, vault_git_lock,
     set_session, significant_diff, update_vault_head, vault_head,
     write_manifest_entry, COMPACT_FIRST_AT, COMPACT_REPEAT,
 )
@@ -55,6 +58,20 @@ from voice import send_voice_reply
 
 
 def _dispatch_stray_turn(uid, chat_id, events):
+    """Ничейный ход в чат. Если это продолжение из мягкого досыла, сперва ждём,
+    пока в чат уйдёт ответ хода, в который его дослали (иначе хвост обгонит начало).
+    Ждём в своём потоке: читатель резидента блокировать нельзя."""
+    gate = _FOLLOWUP_GATES.pop(ckey(chat_id), None)
+    if gate is not None and not gate.is_set():
+        def _later():
+            gate.wait(180)
+            _dispatch_stray_now(uid, chat_id, events)
+        threading.Thread(target=carry(_later), daemon=True).start()
+        return
+    _dispatch_stray_now(uid, chat_id, events)
+
+
+def _dispatch_stray_now(uid, chat_id, events):
     """2026-07-02: ход, начатый самим harness'ом (будильник фонового агента),
     раньше копился в трубе и вываливался при следующем сообщении хозяина.
     Теперь читатель резидента отдаёт его сюда СРАЗУ по завершении — шлём в чат
@@ -83,11 +100,15 @@ def _dispatch_stray_turn(uid, chat_id, events):
                         parts.append("\n\n")
                     parts.append(blk["text"])
     text = "".join(parts).strip()
+    # 05.10.2026: ничейный ход тоже кончается точкой «·» от крюка сохранения, а этот тракт
+    # её не срезал: ход из одной точки уходил в чат отдельным сообщением «·».
+    text = re.sub(r"(?m)^[ \t]*·[ \t]*\n?", "", text).strip()
     if not text:
         for ev in reversed(events):
             if ev.get("type") == "result":
                 text = ev.get("result") or ""
                 break
+        text = re.sub(r"(?m)^[ \t]*·[ \t]*\n?", "", text or "").strip()
     if not (text or "").strip():
         return
     log(f"stray-turn flush → chat={chat_id}, {len(text)} chars")
@@ -104,7 +125,7 @@ def _dispatch_stray_turn(uid, chat_id, events):
             send_chunked(chat_id, cleaned)
         if bg_spec:
             log(f"  __BG_TASK__ принят из stray-хода: {bg_spec['label']!r}")
-            threading.Thread(target=_run_bg_task, args=(uid, chat_id, bg_spec), daemon=True).start()
+            threading.Thread(target=carry(_run_bg_task), args=(uid, chat_id, bg_spec), daemon=True).start()
     except Exception as e:
         log(f"stray-turn dispatch err: {e}")
 
@@ -165,7 +186,54 @@ def _run_bg_task(uid, chat_id, spec):
             pass
 
 
+def _doc_fail_followup(uid, chat_id, fails):
+    """Файл из ответа не ушёл в чат: отдельным ходом говорим модели, пусть чинит сама
+    (режет, шлёт заново или объясняет хозяину). Повторный провал внутри этого хода
+    нового пинка не заводит (source="docfail"), чтобы не крутиться по кругу."""
+    lines = "\n".join(f"- {f['name']} ({f['mb']} МБ): {f['reason']}. Путь: {f['path']}" for f in fails)
+    synthetic = (
+        "[ФАЙЛ НЕ ОТПРАВИЛСЯ]\n"
+        f"Ядро не смогло отправить в чат файлы из твоего прошлого ответа:\n{lines}\n"
+        "Хозяин вместо файла видит строку-предупреждение. Не жди, пока он заметит: "
+        "реши сам. Слишком большой или канал не тянет — порежь на части поменьше (например по 20 МБ) "
+        "и пришли их путями на отдельных строках. Не выходит — коротко скажи хозяину, что не так."
+    )
+    try:
+        process_user_text(uid, chat_id, synthetic, source="docfail",
+                           summary_text="docfail", _bg=True)
+    except Exception as e:
+        log(f"docfail follow-up error: {e}")
+
+
+def _session_key(uid, chat_id):
+    """Ключ беседы в sessions.json. Группа (chat_id<0) — одна сессия на чат, все
+    участники в общем контексте; личка — сессия на человека. С темой (08.10.2026)
+    к ключу приписывается ":t<тема>", без темы он ровно прежний."""
+    base = chat_id if isinstance(chat_id, int) and chat_id < 0 else uid
+    return tkey(base, chat_id)
+
+
+def reset_key(uid, chat_id):
+    """Какую беседу чистят /new и /compact. Без темы — uid, как было всегда;
+    в теме — беседа этой темы (тот же ключ, что у хода)."""
+    return _session_key(uid, chat_id)  # 09.10.2026: в группе без темы чистился uid, а беседа лежит под номером чата; /new в группах был пустышкой
+
+
 def process_user_text(uid, chat_id, full, *, msg_id=None, source="tg", summary_text=None, _bg=False):
+    """Ход с закреплённым движком (08.10.2026, engine.py): флажок решается один раз
+    в начале хода, файл бесед до конца хода берётся от этого движка."""
+    eng, eng_note, eng_hint = engine.begin_turn()
+    engine.pin(eng)
+    try:
+        return _process_user_text(uid, chat_id, full, msg_id=msg_id, source=source,
+                                  summary_text=summary_text, _bg=_bg,
+                                  _eng_note=eng_note, _eng_hint=eng_hint)
+    finally:
+        engine.unpin()
+
+
+def _process_user_text(uid, chat_id, full, *, msg_id=None, source="tg", summary_text=None, _bg=False,
+                       _eng_note="", _eng_hint=""):
     """Common path: invalidation → call_claude → send → compact-prompt → git_sync.
 
     Used by both TG message handler and the /voice HTTP endpoint, so a single
@@ -173,15 +241,15 @@ def process_user_text(uid, chat_id, full, *, msg_id=None, source="tg", summary_t
     regardless of where the input came from.
     Returns the final reply text (after attachment markers stripped).
     """
-    # Group chats (chat_id<0) share one session per chat — all members in common context.
-    # Private chats: per-user session as before.
-    session_key = chat_id if isinstance(chat_id, int) and chat_id < 0 else uid
+    session_key = _session_key(uid, chat_id)
+    # 08.10.2026: ожидания (календарь, отправка) у каждой темы свои; без темы ключ = uid, как было
+    pend_key = tkey(uid, chat_id)
     if msg_id is not None:
         api("setMessageReaction", chat_id=chat_id, message_id=msg_id,
             reaction=json.dumps([{"type": "emoji", "emoji": "👀"}]))
 
 
-    pending_cal = get_pending_cal(uid)
+    pending_cal = get_pending_cal(pend_key)
     full_with_pending = full
     if pending_cal:
         full_with_pending = (
@@ -189,7 +257,7 @@ def process_user_text(uid, chat_id, full, *, msg_id=None, source="tg", summary_t
             + full
         )
         log(f"  pending calendar event for uid={uid} injected into prompt")
-    pending_send = get_pending_send(uid)
+    pending_send = get_pending_send(pend_key)
     if pending_send:
         full_with_pending = (
             f"[PENDING_TG_SEND] {json.dumps(pending_send, ensure_ascii=False)}\n\n"
@@ -204,9 +272,12 @@ def process_user_text(uid, chat_id, full, *, msg_id=None, source="tg", summary_t
     if invalidation == "vault_changed":
         _diff = significant_diff(_saved_head, vault_head())
         log(f"rules changed for uid={uid}: diff={len(_diff)} chars, session kept (no restart)")
-        if _diff:
+        # 23.09.2026: уведомление «Правила обновились» шлётся только при rules_update_notice=true
+        # (по умолчанию); у ботов отдела выключено, в группе это мусор. diff уходит модели всегда.
+        if PROFILE.get("rules_update_notice", True):
             api("sendMessage", chat_id=chat_id,
                 text="🔄 Правила обновились — донёс изменения без перезапуска сессии.")
+        if _diff:
             full_with_pending = (
                 "[СИСТЕМА: твои файлы-правила (CLAUDE.md / Self/ / навыки / команды) изменились "
                 "с прошлого хода. Сессию НЕ перезапускаем — вот точный diff. Применяй новую версию "
@@ -215,51 +286,65 @@ def process_user_text(uid, chat_id, full, *, msg_id=None, source="tg", summary_t
             )
     prompt_for_claude = full_with_pending
 
-    # забрать свежее с общего репозитория ПЕРЕД ответом — увидеть правки с Mac/другого инстанса
-    # (push остаётся в git_sync в конце хода; здесь только pull, без коммита/пуша)
-    try:
-        _penv = {**os.environ, "GIT_TERMINAL_PROMPT": "0", "HOME": PROFILE["home"]}
-        # ветка и склад — из профиля: у иного бота ветка master и внешний склад
-        _rem, _br = PROFILE["git_remote"], PROFILE["git_branch"]
-        _up = f"{_rem}/{_br}"
-        # застрявшее конфликтное слияние: в git_sync такая проверка есть, здесь
-        # её не было — и подтягивание лезло сливать поверх недорешённого
-        # конфликта (найдено на разборе 26.08.2026).
-        if (VAULT / ".git" / "MERGE_HEAD").exists():
-            _u = subprocess.run(["git", "-C", str(VAULT), "ls-files", "-u"],
-                                capture_output=True, env=_penv, timeout=10)
-            if _u.stdout.strip():
-                subprocess.run(["git", "-C", str(VAULT), "merge", "--abort"],
-                               check=False, capture_output=True, env=_penv, timeout=10)
-                log("  pre-turn pull: откатил застрявшее слияние")
-        # спасательный коммит: бот мог умереть посреди прошлого хода, и
-        # несохранённое висит в рабочей папке. Слияние такое затопчет, поэтому
-        # сначала фиксируем как есть — без отправки в склад.
-        _dirty = subprocess.run(["git", "-C", str(VAULT), "status", "--porcelain"],
-                                capture_output=True, env=_penv, timeout=15)
-        if _dirty.stdout.strip():
-            subprocess.run(["git", "-C", str(VAULT), "add", "-A"],
-                           check=False, capture_output=True, env=_penv, timeout=15)
-            _rc = subprocess.run(
-                ["git", "-C", str(VAULT), "commit", "-m",
-                 "rescue: несохранённое перед ходом "
-                 + datetime.now(MSK).strftime("%Y-%m-%d %H:%M")],
-                capture_output=True, env=_penv, timeout=15)
-            if _rc.returncode == 0:
-                log("  pre-turn pull: спасательный коммит")
-        subprocess.run(["git", "-C", str(VAULT), "fetch", _rem, _br],
-                       check=False, capture_output=True, env=_penv, timeout=20)
-        _ff = subprocess.run(["git", "-C", str(VAULT), "merge", "--ff-only", _up],
-                             capture_output=True, env=_penv, timeout=15)
-        if _ff.returncode != 0:
-            _mr = subprocess.run(["git", "-C", str(VAULT), "merge", "--no-edit",
-                                  "-m", "auto-merge pre-turn pull", _up],
-                                 capture_output=True, env=_penv, timeout=20)
-            if _mr.returncode != 0:
-                subprocess.run(["git", "-C", str(VAULT), "merge", "--abort"],
-                               check=False, capture_output=True, env=_penv, timeout=10)
-    except Exception as _pe:
-        log(f"  pre-turn pull err: {_pe}")
+    # ВЫКЛЮЧАТЕЛЬ 28.08.2026 (хозяин): весь git перед ходом стоил 4-10с между 👀 и
+    # «принял, думаю…». Прячем за тем же выключателем профиля, что и git_sync в конце хода.
+    if PROFILE.feature("git_sync"):
+        # забрать свежее с общего репозитория ПЕРЕД ответом — увидеть правки с Mac/другого инстанса
+        # (push остаётся в git_sync в конце хода; здесь только pull, без коммита/пуша)
+        # 08.10.2026: под тем же замком, что git_sync, — соседняя тема может коммитить
+        try:
+            with vault_git_lock():
+                _penv = {**os.environ, "GIT_TERMINAL_PROMPT": "0", "HOME": PROFILE["home"]}
+                # ветка и склад — из профиля: у иного бота ветка master и внешний склад
+                _rem, _br = PROFILE["git_remote"], PROFILE["git_branch"]
+                _up = f"{_rem}/{_br}"
+                # застрявшее конфликтное слияние: в git_sync такая проверка есть, здесь
+                # её не было — и подтягивание лезло сливать поверх недорешённого
+                # конфликта (найдено на разборе 26.08.2026).
+                if (VAULT / ".git" / "MERGE_HEAD").exists():
+                    _u = subprocess.run(["git", "-C", str(VAULT), "ls-files", "-u"],
+                                        capture_output=True, env=_penv, timeout=10)
+                    if _u.stdout.strip():
+                        subprocess.run(["git", "-C", str(VAULT), "merge", "--abort"],
+                                       check=False, capture_output=True, env=_penv, timeout=10)
+                        log("  pre-turn pull: откатил застрявшее слияние")
+                # спасательный коммит: бот мог умереть посреди прошлого хода, и
+                # несохранённое висит в рабочей папке. Слияние такое затопчет, поэтому
+                # сначала фиксируем как есть — без отправки в склад.
+                _dirty = subprocess.run(["git", "-C", str(VAULT), "status", "--porcelain"],
+                                        capture_output=True, env=_penv, timeout=15)
+                # Умный спасатель (28.08.2026, одобрено хозяином): если грязны ТОЛЬКО
+                # авто-файлы (дневные логи разговоров, журнал нагрузки) — не коммитим
+                # перед ходом. Они перегенерируются кодом каждый ход, терять нечего,
+                # а add+commit по 8900 файлам стоил 4-6с на КАЖДОЕ сообщение и
+                # раздувал склад. Любой другой грязный файл — спасаем как раньше.
+                _AUTO_RE = ("Resources/chat-logs/processed/", "журнал-нагрузки")
+                _paths = [l[3:].strip().strip('"') for l in
+                          _dirty.stdout.decode(errors="replace").splitlines() if len(l) > 3]
+                _only_auto = bool(_paths) and all(any(m in p2 for m in _AUTO_RE) for p2 in _paths)
+                if _dirty.stdout.strip() and not _only_auto:
+                    subprocess.run(["git", "-C", str(VAULT), "add", "-A"],
+                                   check=False, capture_output=True, env=_penv, timeout=15)
+                    _rc = subprocess.run(
+                        ["git", "-C", str(VAULT), "commit", "-m",
+                         "rescue: несохранённое перед ходом "
+                         + datetime.now(MSK).strftime("%Y-%m-%d %H:%M")],
+                        capture_output=True, env=_penv, timeout=15)
+                    if _rc.returncode == 0:
+                        log("  pre-turn pull: спасательный коммит")
+                subprocess.run(["git", "-C", str(VAULT), "fetch", _rem, _br],
+                               check=False, capture_output=True, env=_penv, timeout=20)
+                _ff = subprocess.run(["git", "-C", str(VAULT), "merge", "--ff-only", _up],
+                                     capture_output=True, env=_penv, timeout=15)
+                if _ff.returncode != 0:
+                    _mr = subprocess.run(["git", "-C", str(VAULT), "merge", "--no-edit",
+                                          "-m", "auto-merge pre-turn pull", _up],
+                                         capture_output=True, env=_penv, timeout=20)
+                    if _mr.returncode != 0:
+                        subprocess.run(["git", "-C", str(VAULT), "merge", "--abort"],
+                                       check=False, capture_output=True, env=_penv, timeout=10)
+        except Exception as _pe:
+            log(f"  pre-turn pull err: {_pe}")
 
     # розетка хозяина: его обработчики из <хранилище>/.claude/bot-ext могут
     # дописать в промпт своё. Упало расширение — берём промпт как был.
@@ -267,13 +352,39 @@ def process_user_text(uid, chat_id, full, *, msg_id=None, source="tg", summary_t
              "state_dir": str(Path(PROFILE["cache_dir"]) / "ext")}
     prompt_for_claude = botext.apply_point("on_prompt", prompt_for_claude, _ectx, log)
 
-    log(f"→ claude (uid={uid}, src={source}, session={sid or 'new'}, {len(full)} chars)")
+    if _eng_hint:
+        prompt_for_claude = _eng_hint + prompt_for_claude
+    if engine.current() == "codex" and not sid:
+        prompt_for_claude = engine.CODEX_INTRO + prompt_for_claude
+    eng_lines = [_eng_note] if _eng_note else []
+    log(f"→ {engine.current()} (uid={uid}, src={source}, session={sid or 'new'}, {len(full)} chars)")
 
     t0 = time.time()
     with TypingPulser(chat_id):
         # In group chats placeholder leaks to other bots before deletion → duplicate replies. Suppress.
-        _status_chat = chat_id if not (isinstance(chat_id, int) and chat_id < 0) else None
-        reply, new_sid, used_tokens, ctx_tokens, _status_mid = call_claude(prompt_for_claude, sid, status_chat_id=_status_chat, bg_wait=_bg)
+        # 23.09.2026: group_status_panel в профиле — панель и кнопка ⏹СТОП и в группе (слово хозяина);
+        # без флага в группах панели нет, а с ней нет ни стопа, ни прерывания новым сообщением.
+        _status_chat = chat_id if (not (isinstance(chat_id, int) and chat_id < 0) or PROFILE.get("group_status_panel", False)) else None
+        reply, new_sid, used_tokens, ctx_tokens, _status_mid = call_claude(prompt_for_claude, sid, status_chat_id=_status_chat, bg_wait=_bg, chat_id=chat_id)
+        # 08.10.2026, слово хозяина: Клод упёрся в лимит → этот же ход отвечает Кодекс,
+        # и до сброса лимита бот сидит на Кодексе. Кодекса нет у бота — всё как было.
+        _until = engine.limit_until(reply) if engine.current() == "claude" and engine.codex_available() else None
+        if _until:
+            log(f"  claude limit: {reply.strip()[:120]!r} → Кодекс до {engine.fmt_hhmm(_until)}")
+            if new_sid and new_sid != sid:
+                set_session(session_key, new_sid, add_tokens=used_tokens)
+            if _status_mid is not None and _status_chat is not None:
+                try:
+                    api("deleteMessage", chat_id=_status_chat, message_id=_status_mid)
+                except Exception:
+                    pass
+            engine.set_engine("codex", until=_until, reason="limit")
+            engine.pin("codex")
+            sid, _, _ = get_session(session_key)
+            eng_lines.append(f"⚡ Клод упёрся в лимит до {engine.fmt_hhmm(_until)}, отвечает Кодекс.")
+            reply, new_sid, used_tokens, ctx_tokens, _status_mid = call_claude(
+                (prompt_for_claude if sid else engine.CODEX_INTRO + prompt_for_claude),
+                sid, status_chat_id=_status_chat, bg_wait=_bg, engine_name="codex", chat_id=chat_id)
     dt = time.time() - t0
     # 2026-06-17: ход был прерван догонкой — его пустой ответ подавлен в call_claude.
     # Ничего не постим, сессию/коммит не трогаем (догонка делает свой полный цикл).
@@ -282,6 +393,10 @@ def process_user_text(uid, chat_id, full, *, msg_id=None, source="tg", summary_t
         return ""
     log(f"← claude ({dt:.1f}s, {len(reply)} chars, session={new_sid}, ctx={used_tokens})")
     reply = botext.apply_point("on_reply", reply, _ectx, log)
+    # 23.09.2026: Stop-крюк save-gate отвечает одной «·», ядро клеит её к последней строке
+    # и ломает маркеры конца ответа (__BG_TASK__, __WROTE__, __TASK__: регулярки требуют конца
+    # строки). Срезаем одинокую точку в хвосте до разбора маркеров. Найдено на приёмке бота отдела.
+    reply = re.sub(r"\s*·\s*$", "", reply)
 
     # Fix-D/E/G: extract __WROTE__ / __TASK__ markers, build status lines, write manifest.
     reply, wrote_entries = parse_wrote_markers(reply)
@@ -289,21 +404,25 @@ def process_user_text(uid, chat_id, full, *, msg_id=None, source="tg", summary_t
     reply, bg_spec = parse_bg_task_marker(reply)
     tasks_appended = append_tasks_from_markers(task_texts)
     wrote_status_lines = []
+    # 24.09.2026, слово хозяина: «всё, что касается сохранения, должно быть там», то есть
+    # в свёрнутом блоке внизу ответа, а не шапкой над ним. Наверху остаётся только то,
+    # что ждёт действия человека (отправка, календарь).
+    save_lines = []
     for cnt, path in wrote_entries:
-        wrote_status_lines.append(f"✓ {path}" + (f" ({cnt} entries)" if cnt > 1 else ""))
+        save_lines.append(f"✓ {path}" + (f" ({cnt} entries)" if cnt > 1 else ""))
     if tasks_appended:
-        wrote_status_lines.append(f"✓ tasks.md ({tasks_appended} from-tg)")
+        save_lines.append(f"✓ tasks.md ({tasks_appended} from-tg)")
 
     # Calendar markers — propose / confirm / cancel
     reply, cal_propose = parse_cal_propose_marker(reply)
     reply, cal_event = parse_cal_event_marker(reply)
     reply, cal_cancelled = parse_cal_cancel_marker(reply)
     if cal_propose:
-        set_pending_cal(uid, cal_propose)
+        set_pending_cal(pend_key, cal_propose)
         log(f"  __CAL_PROPOSE__ stored for uid={uid}: {cal_propose.get('title','?')} @ {cal_propose.get('start','?')}")
         wrote_status_lines.append(f"⏳ календарь: ждёт подтверждения ({PENDING_CAL_TTL_SEC // 60}мин)")
     if cal_event:
-        clear_pending_cal(uid)
+        clear_pending_cal(pend_key)
         link = cal_event.get("link") or ""
         title = cal_event.get("title", "событие")
         start = cal_event.get("start", "")
@@ -313,7 +432,7 @@ def process_user_text(uid, chat_id, full, *, msg_id=None, source="tg", summary_t
             line += f"\n   {link}"
         wrote_status_lines.append(line)
     if cal_cancelled:
-        clear_pending_cal(uid)
+        clear_pending_cal(pend_key)
         log(f"  __CAL_CANCEL__ for uid={uid}")
         wrote_status_lines.append("❌ календарь: отменено")
 
@@ -321,6 +440,15 @@ def process_user_text(uid, chat_id, full, *, msg_id=None, source="tg", summary_t
     reply, tg_propose = parse_tg_send_propose_marker(reply)
     reply, tg_confirm = parse_tg_send_confirm_marker(reply)
     reply, tg_cancel = parse_tg_send_cancel_marker(reply)
+    if tg_cancel:
+        # Отмена идёт ПЕРВОЙ, до предложения. Иначе «отменяю старое и предлагаю
+        # новое» в одном ответе кончается тем, что отмена стирает только что
+        # положенное предложение: очередь одна на человека, кто последний — тот
+        # и прав. Инцидент 27.08: в 12:11 бот так похоронил собственное письмо,
+        # в 12:55 сказал «Отправляю», а отправлять было нечего.
+        clear_pending_send(pend_key)
+        log(f"  __TG_SEND_CANCEL__ for uid={uid}")
+        wrote_status_lines.append("❌ отправка отменена")
     if tg_propose:
         # claude предложил отправку — резолвим адресата и кладём в pending.
         to_q = str(tg_propose.get("to", "")).strip()
@@ -334,7 +462,7 @@ def process_user_text(uid, chat_id, full, *, msg_id=None, source="tg", summary_t
                          "peer_id": res.get("peer_id"),
                          "display": res.get("display") or to_q,
                          "username": res.get("username")}
-                set_pending_send(uid, entry)
+                set_pending_send(pend_key, entry)
                 uname = f" (@{entry['username']})" if entry.get("username") else ""
                 log(f"  __TG_SEND_PROPOSE__ stored uid={uid}: → {entry['display']} [{entry['peer_id']}]")
                 wrote_status_lines.append(
@@ -366,7 +494,7 @@ def process_user_text(uid, chat_id, full, *, msg_id=None, source="tg", summary_t
             if not res.get("ok") and _uname:
                 # username не сработал — пробуем прежним путём, по номеру
                 res = tg_send_now(pending_send.get("peer_id"), pending_send.get("text", ""))
-            clear_pending_send(uid)
+            clear_pending_send(pend_key)
             if res.get("ok"):
                 log(f"  TG SENT uid={uid} → {res.get('display','?')} [{pending_send.get('peer_id')}]")
                 wrote_status_lines.append(f"📤 отправлено → {res.get('display') or pending_send.get('display','?')}")
@@ -375,11 +503,10 @@ def process_user_text(uid, chat_id, full, *, msg_id=None, source="tg", summary_t
                 wrote_status_lines.append(f"⚠️ не отправилось: {res.get('error','?')}")
         else:
             log(f"  __TG_SEND_CONFIRM__ без pending (uid={uid}) — игнор")
-            wrote_status_lines.append("⚠️ нечего отправлять — предложения в очереди нет")
-    if tg_cancel:
-        clear_pending_send(uid)
-        log(f"  __TG_SEND_CANCEL__ for uid={uid}")
-        wrote_status_lines.append("❌ отправка отменена")
+            wrote_status_lines.append(
+                "🚫 НЕ ОТПРАВЛЕНО. Очередь пуста: предложение отменено или "
+                "просрочено. Что бы ни было написано ниже — наружу не ушло "
+                "ничего. Предложи отправку заново.")
 
     if wrote_entries or task_texts:
         write_manifest_entry({
@@ -410,11 +537,12 @@ def process_user_text(uid, chat_id, full, *, msg_id=None, source="tg", summary_t
 
     if new_sid:
         set_session(session_key, new_sid, add_tokens=used_tokens)
+        note_topic_session(chat_id, topic_of(chat_id), new_sid)
 
     count = get_msg_count(session_key)
     if count >= COMPACT_FIRST_AT and (count - COMPACT_FIRST_AT) % COMPACT_REPEAT == 0:
-        api("sendMessage", chat_id=chat_id,
-            text=f"⚠️ {count} сообщений в сессии — контекст растёт. /compact чтобы сжать или /new чтобы начать заново.")
+        # раньше шло отдельным сообщением и сыпалось в группы; теперь в том же подвале
+        save_lines.append(f"⚠️ {count} сообщений в сессии: /compact чтобы сжать или /new чтобы начать заново")
     session_total = get_total_tokens(session_key)
 
     reply, choices_labels = parse_choices_marker(reply)
@@ -427,20 +555,28 @@ def process_user_text(uid, chat_id, full, *, msg_id=None, source="tg", summary_t
     # Иначе при ответе одними путями под фото оставались только заголовки. (2026-05-15)
     reply = extract_and_send_images(chat_id, reply)
     reply = extract_and_send_documents(chat_id, reply)
+    _doc_fails = pop_doc_failures(chat_id)
+    if _doc_fails and source != "docfail":
+        threading.Thread(target=carry(_doc_fail_followup), args=(uid, chat_id, _doc_fails), daemon=True).start()
 
-    status_block_parts = []
+    status_block_parts = list(eng_lines)
     if attachment_status:
         status_block_parts.append(attachment_status)
     if wrote_status_lines:
         status_block_parts.extend(wrote_status_lines)
     if status_block_parts:
         reply = ("\n".join(status_block_parts) + "\n\n" + reply).strip()
+    # одинокая «·» от Stop-крюка могла стоять перед маркерами и пережить срез выше
+    reply = re.sub(r"(?m)^[ \t]*·[ \t]*\n?", "", reply).strip()
+    if save_lines:
+        reply = (reply + "\n\n" + "\n".join("> " + x for x in [SAVE_FOOTER_HEAD] + save_lines)).strip()
 
     # Флаг: если после извлечения картинок и статусов основной текст пуст —
     # не шлём «пустое» сообщение с одним ctx-заголовком под фото. (2026-05-15)
     skip_send = not reply.strip()
 
-    if used_tokens and not skip_send:
+    # 23.09.2026: ctx_header=false в профиле — шапку не печатаем (боты отдела, слово хозяина)
+    if used_tokens and not skip_send and PROFILE.get("ctx_header", True):
         def _fmt(n):
             if n >= 1_000_000:
                 return f"{n/1_000_000:.2f}M"
@@ -466,7 +602,8 @@ def process_user_text(uid, chat_id, full, *, msg_id=None, source="tg", summary_t
     if not skip_send:
         _choices = choices_labels
         # дефолтная лупа, если модель не поставила ни одной своей кнопки
-        want_dig = want_dig or auto_dig(reply, _choices, want_affirm, want_dig)
+        # 23.09.2026 (слово хозяина «лупу убери вообще»): dig_button=false в профиле глушит и маркер модели, и авто-лупу
+        want_dig = bool(PROFILE.get("dig_button", True)) and (want_dig or auto_dig(reply, _choices, want_affirm, want_dig))
         if voice_reply:
             ok = send_voice_reply(chat_id, reply, voice=voice_name, engine=voice_engine)
             if not ok:
@@ -481,8 +618,13 @@ def process_user_text(uid, chat_id, full, *, msg_id=None, source="tg", summary_t
     if bg_spec:
         log(f"  __BG_TASK__ принят (uid={uid}): {bg_spec['label']!r} timeout={bg_spec['timeout']}s")
         threading.Thread(
-            target=_run_bg_task, args=(uid, chat_id, bg_spec), daemon=True
+            target=carry(_run_bg_task), args=(uid, chat_id, bg_spec), daemon=True
         ).start()
+
+    # 25.09.2026, мягкий досыл: ответ хода в чате — продолжение из досланного можно отпускать
+    _gate = _FOLLOWUP_GATES.get(ckey(chat_id))
+    if _gate is not None:
+        _gate.set()
 
     s_summary = ((summary_text if summary_text is not None else full)[:50] or "msg").replace("\n", " ")
 
@@ -503,8 +645,17 @@ def process_user_text(uid, chat_id, full, *, msg_id=None, source="tg", summary_t
     return reply
 
 def do_compact(uid, chat_id):
+    engine.pin(engine.stored())
+    try:
+        return _do_compact(uid, chat_id)
+    finally:
+        engine.unpin()
+
+
+def _do_compact(uid, chat_id):
     """Summarise current session via Claude, start fresh session with that summary as context."""
-    sid, _, _ = get_session(uid)
+    skey = reset_key(uid, chat_id)   # 08.10.2026: в теме сжимается беседа темы
+    sid, _, _ = get_session(skey)
     if not sid:
         api("sendMessage", chat_id=chat_id, text="Нет активной сессии — нечего компактить.")
         return
@@ -536,7 +687,7 @@ def do_compact(uid, chat_id):
     )
     # 2026-06-06 fix: убить резидент перед новой сессией, иначе handoff уйдёт в старую.
     with _RESIDENT_LOCK:
-        rc_kill = _RESIDENT.pop(chat_id, None)
+        rc_kill = _RESIDENT.pop(ckey(chat_id), None)
     if rc_kill:
         try: rc_kill.kill()
         except Exception as e: log(f"  /compact: resident kill err: {e}")
@@ -547,7 +698,8 @@ def do_compact(uid, chat_id):
         api("sendMessage", chat_id=chat_id, text="⚠️ Не удалось начать новую сессию после компакта.")
         return
 
-    set_session(uid, new_sid, msg_count=1)
-    update_vault_head(uid)
+    set_session(skey, new_sid, msg_count=1)
+    update_vault_head(skey)
+    note_topic_session(chat_id, topic_of(chat_id), new_sid)
     api("sendMessage", chat_id=chat_id,
         text=f"✅ Контекст сжат, новая сессия начата.\n\nКонспект:\n{summary}")

@@ -10,6 +10,9 @@
 разбором вложений, состояние меню в конце файла. Ключ у всех один и тот же —
 chat_id, живут они ровно столько, сколько живёт процесс, и чинить гонку удобнее,
 когда весь этот слой лежит в одном месте и виден целиком.
+
+С 08.10.2026 ключ словарей — беседа (ckey): без темы Telegram это тот же
+chat_id, с темой пара (chat_id, тема). Устройство в блоке «ТЕМЫ» ниже.
 """
 import json
 import re
@@ -70,7 +73,9 @@ PENDING_CAL_TTL_SEC = 600       # pending calendar proposal expires after 10min
 # Жёсткий рубеж №2: отправку в Telegram делает ТОЛЬКО этот код после подтверждения
 # хозяина. claude к отправке доступа не имеет (telegram-mcp в режиме read-only).
 PENDING_SEND_FILE = CACHE_DIR / "pending-tgsend.json"
-PENDING_SEND_TTL_SEC = 600      # предложение отправки ждёт подтверждения 10 мин
+PENDING_SEND_TTL_SEC = 1800     # предложение отправки ждёт подтверждения 30 мин.
+                                # Было 10 — не хватало: 27.08 хозяин ответил через
+                                # 44 минуты, предложение к тому часу уже истлело.
 TG_SEND_ONESHOT = PROFILE["tg_send_oneshot"]
 TG_SEND_PYTHON = PROFILE["tg_send_python"]
 TASKS_FILE = VAULT / "Tasks" / "tasks.md"
@@ -85,6 +90,11 @@ SESSION_TTL_HOURS = 6
 VOICE_PORT = PROFILE["voice_port"]
 SHORTCUT_TOKEN_FILE = f"{_SECRETS}/shortcut-token"
 VOICE_CERT = f"{_SECRETS}/voice-cert.pem"
+INJECT_PORT = PROFILE["inject_port"]
+INJECT_TOKEN_FILE = f"{_SECRETS}/inject-token"
+PULT_PORT = PROFILE["pult_port"]
+PULT_HOST = PROFILE["pult_host"]
+PULT_URL = PROFILE["pult_url"]
 VOICE_KEY = f"{_SECRETS}/voice-key.pem"
 
 # --- Voice-reply (edge-tts default, zvukogram for meme voices) ---
@@ -136,6 +146,16 @@ def read_shortcut_token():
 
 TOKEN = read_token()
 SHORTCUT_TOKEN = read_shortcut_token()
+
+
+def read_inject_token():
+    try:
+        return Path(INJECT_TOKEN_FILE).read_text().strip() or None
+    except Exception:
+        return None
+
+
+INJECT_TOKEN = read_inject_token()
 API = f"{PROFILE['api_base']}/bot{TOKEN}"
 FILE_API = f"{PROFILE['api_base']}/file/bot{TOKEN}"
 
@@ -166,6 +186,9 @@ _STOP_FLAGS = {}
 _STOP_POSTED = {}
 # chat_id → ссылка на streamed_text текущего хода, чтобы callback ⏹СТОП собрал партиал.
 _STREAM_PARTIAL = {}
+# 25.09.2026, мягкий досыл: chat_id → Event «ответ идущего хода уже в чате». Ничейный ход
+# с продолжением ждёт его, чтобы не обогнать начало ответа.
+_FOLLOWUP_GATES = {}
 
 # 2026-06-17: «догонка». Один ход на чат в момент времени — замок на chat_id.
 # Если приходит новое сообщение пока идёт ход, оно НЕ ждёт молча (старый Popen-режим
@@ -183,6 +206,7 @@ _INTERRUPTED_SENTINEL = "\x00INTERRUPTED\x00"
 
 
 def _get_turn_lock(chat_id):
+    """Замок хода на беседу. Ключ — ckey(): без темы это голый chat_id, как было."""
     with _TURN_LOCKS_GUARD:
         lk = _TURN_LOCKS.get(chat_id)
         if lk is None:
@@ -190,11 +214,177 @@ def _get_turn_lock(chat_id):
             _TURN_LOCKS[chat_id] = lk
         return lk
 
+
+# ============================================================================
+# ТЕМЫ (08.10.2026, слово хозяина «давай делать»): параллельные беседы в личке с
+# темами Telegram (Threaded Mode у BotFather) и в форум-группах. Беседа = чат +
+# тема. Тема None (тем нет или общий вид) = ключ РОВНО прежний, словари и
+# sessions.json те же, что до тем; у ботов без тем не меняется ничего.
+#
+# Тема хода закрепляется на поток (как engine.pin) на входе: сообщение, кнопка,
+# /inject, фон. Дальше её видят ключи словарей (ckey/tkey) и tgapi.api, который
+# сам подставляет message_thread_id во все отправки в этот чат. Потоки, рождённые
+# внутри хода, закреплённое не наследуют: их цель оборачивается в carry().
+# ============================================================================
+_TOPIC_TLS = threading.local()
+_PINNED = object()
+
+
+def msg_topic(msg):
+    """Номер темы из сообщения Telegram или None. В обычной супергруппе
+    message_thread_id бывает и у ветки ответов, темой его считаем только с
+    is_topic_message; в личке веток ответов нет, там номер и есть тема."""
+    if not isinstance(msg, dict):
+        return None
+    tid = msg.get("message_thread_id")
+    if not tid:
+        return None
+    chat_type = (msg.get("chat") or {}).get("type")
+    if msg.get("is_topic_message") or chat_type == "private":
+        try:
+            return int(tid)
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def pin_topic(chat_id, thread_id):
+    _TOPIC_TLS.pin = (chat_id, int(thread_id)) if thread_id else None
+
+
+def unpin_topic():
+    _TOPIC_TLS.pin = None
+
+
+def pinned_topic():
+    return getattr(_TOPIC_TLS, "pin", None)
+
+
+def topic_of(chat_id):
+    """Тема, закреплённая на поток, если она про этот чат. Иначе None:
+    отправка в чужой чат (группу, другого человека) тему не получает."""
+    p = pinned_topic()
+    if p is None or chat_id is None:
+        return None
+    return p[1] if str(p[0]) == str(chat_id) else None
+
+
+def ckey(chat_id, thread_id=_PINNED):
+    """Ключ беседы для живых словарей: chat_id без темы, (chat_id, тема) с темой."""
+    tid = topic_of(chat_id) if thread_id is _PINNED else thread_id
+    return (chat_id, int(tid)) if tid else chat_id
+
+
+def ckey_chat(key):
+    return key[0] if isinstance(key, tuple) else key
+
+
+def ckey_topic(key):
+    return key[1] if isinstance(key, tuple) else None
+
+
+def tkey(base, chat_id=None, thread_id=_PINNED):
+    """Строковый ключ на диске (sessions.json, ожидания): "<base>" без темы,
+    "<base>:t<тема>" с темой. Тема берётся по чату chat_id (по умолчанию base)."""
+    if thread_id is _PINNED:
+        thread_id = topic_of(base if chat_id is None else chat_id)
+    return f"{base}:t{int(thread_id)}" if thread_id else str(base)
+
+
+class in_topic:
+    """with in_topic(chat_id, тема): ... — закрепить тему на время блока."""
+    def __init__(self, chat_id, thread_id):
+        self.pin = (chat_id, int(thread_id)) if thread_id else None
+
+    def __enter__(self):
+        self._prev = pinned_topic()
+        _TOPIC_TLS.pin = self.pin
+        return self
+
+    def __exit__(self, *exc):
+        _TOPIC_TLS.pin = self._prev
+        return False
+
+
+# Названия тем и их сессии: <cache>/topics.json, ключ "<chat_id>:t<тема>".
+# Название приходит один раз, сервисным forum_topic_created (и forum_topic_edited
+# при переименовании); номер сессии нужен логу переписки, чтобы подписать реплики
+# темой. Нет названия — подписываем номером.
+TOPICS_FILE = CACHE_DIR / "topics.json"
+_TOPICS_LOCK = threading.Lock()
+
+
+def _topics_load():
+    try:
+        d = json.loads(TOPICS_FILE.read_text(encoding="utf-8"))
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def _topics_save(d):
+    tmp = TOPICS_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(d, ensure_ascii=False, indent=1), encoding="utf-8")
+    tmp.replace(TOPICS_FILE)
+
+
+def remember_topic_title(chat_id, thread_id, title):
+    if not thread_id or not (title or "").strip():
+        return
+    with _TOPICS_LOCK:
+        d = _topics_load()
+        rec = d.setdefault(f"{chat_id}:t{int(thread_id)}", {})
+        rec["title"] = title.strip()[:120]
+        _topics_save(d)
+
+
+def note_topic_session(chat_id, thread_id, sid):
+    if not thread_id or not sid:
+        return
+    with _TOPICS_LOCK:
+        d = _topics_load()
+        rec = d.setdefault(f"{chat_id}:t{int(thread_id)}", {})
+        sids = rec.setdefault("sessions", [])
+        if sid not in sids:
+            sids.append(sid)
+            _topics_save(d)
+
+
+def topic_title(chat_id, thread_id):
+    if not thread_id:
+        return None
+    rec = _topics_load().get(f"{chat_id}:t{int(thread_id)}") or {}
+    return rec.get("title")
+
+
+def topic_label(chat_id, thread_id):
+    """Название темы или «тема <номер>»."""
+    return topic_title(chat_id, thread_id) or f"тема {int(thread_id)}"
+
+
+def topic_session_name(chat_id, thread_id):
+    """Имя беседы темы в списке Claude Code."""
+    return f"TG: {topic_label(chat_id, thread_id)}"
+
+
+def carry(fn):
+    """Обернуть цель потока: новый поток получит тему того, кто его родил."""
+    pin = pinned_topic()
+
+    def run(*a, **kw):
+        prev = pinned_topic()
+        _TOPIC_TLS.pin = pin
+        try:
+            return fn(*a, **kw)
+        finally:
+            _TOPIC_TLS.pin = prev
+    return run
+
 _album_lock = threading.Lock()
 _album_buffers = {}   # media_group_id -> {"msgs": [msg, ...], "timer": Timer, "first_chat": int}
 
 _burst_lock = threading.Lock()
-_burst_buffers = {}  # (uid, chat_id) -> {"msgs": [...], "timer": Timer}
+_burst_buffers = {}  # (uid, ckey) -> {"msgs": [...], "timer": Timer}
 
 # Per-chat: id of the message currently holding the brief keyboard.
 _brief_active_msg = {}

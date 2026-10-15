@@ -18,9 +18,9 @@ import urllib.parse
 import urllib.request
 
 from botctx import (
-    API, TG_CHUNK, TG_SEND_ONESHOT, TG_SEND_PYTHON, log,
+    PROFILE, API, TG_CHUNK, TG_SEND_ONESHOT, TG_SEND_PYTHON, log,
     _CONFIRM_KEYBOARD, _MENU_ROW, _NO_KEYBOARD, _STOP_KEYBOARD,
-    _brief_active_msg,
+    _brief_active_msg, carry, ckey, topic_of,
 )
 
 
@@ -29,7 +29,60 @@ from botctx import (
 _BENIGN_API_ERRORS = ("message is not modified",)
 
 
+# Методы, которые принимают message_thread_id. Правки и удаления (edit*, delete*)
+# адресуют сообщение по номеру, тема им не нужна и не принимается.
+TOPIC_METHODS = frozenset({
+    "sendMessage", "sendRichMessage", "sendPhoto", "sendDocument", "sendVoice",
+    "sendAudio", "sendVideo", "sendAnimation", "sendVideoNote", "sendSticker",
+    "sendMediaGroup", "sendChatAction", "sendMessageDraft", "sendLocation",
+    "sendVenue", "sendContact", "sendPoll", "sendDice", "copyMessage",
+    "forwardMessage",
+})
+
+
+def is_topic_error(desc):
+    """Отказ Telegram, который значит «в эту тему нельзя»: тема удалена, закрыта
+    или «мёртвая» (жалоба tdlib/telegram-bot-api #905). Тогда шлём в общий вид."""
+    d = (desc or "").lower()
+    return ("thread not found" in d or "topic_closed" in d or "topic_deleted" in d
+            or "topic closed" in d or "topic deleted" in d or "topic_id_invalid" in d)
+
+
 def api(method, **params):
+    """Вызов Bot API. В ходе из темы (botctx.pin_topic) отправка в этот же чат
+    сама получает message_thread_id. Явный message_thread_id=None = общий вид.
+    Тема отвергла отправку — повтор без темы, молча: ответ важнее места."""
+    if method in TOPIC_METHODS and "message_thread_id" not in params:
+        tid = topic_of(params.get("chat_id"))
+        if tid:
+            params["message_thread_id"] = tid
+    res = _api_call(method, params)
+    if (not res.get("ok") and params.get("message_thread_id")
+            and method in TOPIC_METHODS and is_topic_error(res.get("description"))):
+        log(f"api {method}: тема {params['message_thread_id']} не принимает, шлю в общий вид")
+        retry = {k: v for k, v in params.items() if k != "message_thread_id"}
+        res = _api_call(method, retry)
+    return res
+
+
+def thread_form_part(boundary, chat_id, thread_id):
+    """Кусок multipart-формы с message_thread_id для отправок файлов (фото, документ,
+    голос идут мимо api()). Пусто, если темы нет."""
+    if not thread_id:
+        return b""
+    return (f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="message_thread_id"\r\n\r\n{int(thread_id)}\r\n').encode()
+
+
+def http_error_desc(e):
+    """Причина отказа из тела HTTPError Telegram (тело читается один раз)."""
+    try:
+        return json.loads(e.read().decode("utf-8", "replace")).get("description") or f"HTTP {e.code}"
+    except Exception:
+        return f"HTTP {getattr(e, 'code', '?')}"
+
+
+def _api_call(method, params):
     data = urllib.parse.urlencode(
         {k: v for k, v in params.items() if v is not None}
     ).encode()
@@ -68,7 +121,7 @@ class TypingPulser:
         self._thread = None
 
     def __enter__(self):
-        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread = threading.Thread(target=carry(self._run), daemon=True)
         self._thread.start()
         return self
 
@@ -91,6 +144,86 @@ def esc_html(s):
     return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
+# 09.10.2026 (слово хозяина: «как в клод-коде, percolating… бибопинг»): слова панели
+# взяты как есть из Claude Code 2.1.288, все 189 (вытащены из его бинарника).
+# Слово меняется раз в 8 секунд по часам, поэтому каждый ход начинается с нового.
+THINK_WORDS = [
+    "Accomplishing", "Actioning", "Actualizing", "Architecting", "Baking", "Beaming",
+    "Beboppin'", "Befuddling", "Billowing", "Blanching", "Bloviating", "Boogieing",
+    "Boondoggling", "Booping", "Bootstrapping", "Brewing", "Bunning", "Burrowing",
+    "Calculating", "Canoodling", "Caramelizing", "Cascading", "Catapulting", "Cerebrating",
+    "Channeling", "Choreographing", "Churning", "Clauding", "Coalescing", "Cogitating",
+    "Combobulating", "Composing", "Computing", "Concocting", "Considering", "Contemplating",
+    "Cooking", "Crafting", "Creating", "Crunching", "Crystallizing", "Cultivating",
+    "Deciphering", "Deliberating", "Determining", "Dilly-dallying", "Discombobulating",
+    "Doing", "Doodling", "Drizzling", "Ebbing", "Effecting", "Elucidating", "Embellishing",
+    "Enchanting", "Envisioning", "Fermenting", "Fiddle-faddling", "Finagling", "Flambéing",
+    "Flibbertigibbeting", "Flowing", "Flummoxing", "Fluttering", "Forging", "Forming",
+    "Frolicking", "Frosting", "Gallivanting", "Galloping", "Garnishing", "Generating",
+    "Gesticulating", "Germinating", "Gitifying", "Grooving", "Gusting", "Harmonizing",
+    "Hashing", "Hatching", "Herding", "Honking", "Hullaballooing", "Hyperspacing", "Ideating",
+    "Imagining", "Improvising", "Incubating", "Inferring", "Infusing", "Ionizing",
+    "Jitterbugging", "Julienning", "Kerfuffling", "Kneading", "Leavening", "Levitating",
+    "Lollygagging", "Manifesting", "Marinating", "Meandering", "Metamorphosing", "Misting",
+    "Moonwalking", "Moseying", "Mulling", "Mustering", "Musing", "Nebulizing", "Nesting",
+    "Newspapering", "Noodling", "Nucleating", "Onioning", "Orbiting", "Orchestrating",
+    "Osmosing", "Perambulating", "Percolating", "Perusing", "Philosophizing",
+    "Photosynthesizing", "Polishing", "Pollinating", "Pondering", "Pontificating", "Pouncing",
+    "Precipitating", "Prestidigitating", "Processing", "Proofing", "Propagating", "Puttering",
+    "Puzzling", "Quantumizing", "Razzle-dazzling", "Razzmatazzing", "Recombobulating",
+    "Reticulating", "Roosting", "Ruminating", "Sautéing", "Scampering", "Schlepping",
+    "Scurrying", "Seasoning", "Shenaniganing", "Shimmying", "Simmering", "Skedaddling",
+    "Sketching", "Slithering", "Smooshing", "Sock-hopping", "Spelunking", "Spinning",
+    "Sprouting", "Stewing", "Sublimating", "Swirling", "Swooping", "Symbioting",
+    "Synthesizing", "Tempering", "Thinking", "Thundering", "Tinkering", "Tomfoolering",
+    "Topsy-turvying", "Transfiguring", "Transmogrifying", "Transmuting", "Twisting",
+    "Undulating", "Unfurling", "Unraveling", "Vibing", "Waddling", "Wandering", "Warping",
+    "Whatchamacalliting", "Whirlpooling", "Whirring", "Whisking", "Wibbling", "Working",
+    "Wrangling", "Zesting", "Zigzagging"
+]
+# Ступени по длине хода, тоже из Claude Code (пороги 10, 20, 30, 45 секунд).
+THINK_STAGES = [(45, "deep in thought"), (30, "thinking some more"),
+                (20, "thinking more"), (10, "still thinking")]
+
+
+def _elapsed_sec(elapsed_str):
+    m = re.match(r"(?:(\d+)м )?(\d+)с$", elapsed_str or "")
+    return int(m.group(1) or 0) * 60 + int(m.group(2)) if m else 0
+
+
+# Значок пульсирует, как звёздочка Claude Code: цвет в Telegram тексту не задать,
+# поэтому оранжевые эмодзи по кругу, кадр сменяется раз в 4 секунды (как правка панели).
+THINK_SPIN = ["🔸", "🔶", "✴️", "🔶"]
+
+
+def think_spin(elapsed_str):
+    """Кадр пульса. Если в профиле есть spin_emoji_id, кадр становится запасным
+    текстом живого эмодзи: владельцу с Premium Telegram покажет анимацию,
+    остальным эти же оранжевые эмодзи. В spin_emoji_id можно перечислить
+    несколько номеров через запятую: первый звёздочка, дальше крабы Клод
+    (качается, танцует, саксофон, ноутбук)."""
+    frame = THINK_SPIN[_elapsed_sec(elapsed_str) // 4 % len(THINK_SPIN)]
+    ids = [x.strip() for x in str(PROFILE.get("spin_emoji_id") or "").split(",")
+           if x.strip().isdigit()]
+    if not ids:
+        return frame
+    # 09.10.2026 (хозяин: «по кругу переключалась с рандомом», «звёздочка наравне со всеми»):
+    # раз в 30 с жребий, все значки равны. Жребий от номера получаса, поэтому
+    # внутри 30 секунд значок не дёргается на каждой правке панели.
+    h = (int(time.time()) // 30 * 0x9E3779B1) % 2**32
+    eid = ids[(h >> 3) % len(ids)]
+    return f'<tg-emoji emoji-id="{eid}">{frame}</tg-emoji>'
+
+
+def think_word(elapsed_str):
+    return THINK_WORDS[int(time.time()) // 8 * 7919 % len(THINK_WORDS)]
+
+
+def think_stage(elapsed_str):
+    sec = _elapsed_sec(elapsed_str)
+    return next((name for lim, name in THINK_STAGES if sec >= lim), "thinking")
+
+
 def build_status_panel(hourglass, elapsed_str, action, thinking, tool_lines,
                        streamed, limit=STATUS_PANEL_LIMIT):
     """Собирает HTML живой панели «думаю…» так, чтобы она гарантированно влезала
@@ -110,7 +243,7 @@ def build_status_panel(hourglass, elapsed_str, action, thinking, tool_lines,
     body_max = min(STATUS_PANEL_BODY_MAX, limit)
     think_max = body_max
     for _ in range(24):     # ужимаем, пока не влезет; шаг заведомо сходится
-        parts = [f"{hourglass} думаю… ({elapsed_str})"]
+        parts = [f"{think_spin(elapsed_str)} {think_word(elapsed_str)}… ({elapsed_str} · {think_stage(elapsed_str)})"]
         if action:
             parts.append(esc_html(action))
         think = _tail(thinking, think_max)
@@ -135,7 +268,7 @@ def build_status_panel(hourglass, elapsed_str, action, thinking, tool_lines,
     kept = list(tool_lines[-8:])
     while kept and len("\n".join(esc_html(x) for x in kept)) > limit - 200:
         kept.pop(0)
-    parts = [f"{hourglass} думаю… ({elapsed_str})"]
+    parts = [f"{think_spin(elapsed_str)} {think_word(elapsed_str)}… ({elapsed_str} · {think_stage(elapsed_str)})"]
     if kept:
         parts.append("<blockquote expandable>"
                      + "\n".join(esc_html(x) for x in kept) + "</blockquote>")
@@ -190,6 +323,15 @@ def md_to_html(text):
     text = re.sub(r"^#{1,6}\s+(.+)$", r"<b>\1</b>", text, flags=re.MULTILINE)
     text = re.sub(r"^[ \t]*[\*\-\+][ \t]+", "• ", text, flags=re.MULTILINE)
 
+    # 24.09.2026: подряд идущие строки «> …» → один раскрывающийся блок Telegram
+    # (как вывод инструментов). После html.escape знак «>» уже стал «&gt;».
+    def _quote_block(m):
+        lines = [re.sub(r"^&gt;[ \t]?", "", ln) for ln in m.group(0).rstrip("\n").split("\n")]
+        return "<blockquote expandable>" + "\n".join(lines).strip("\n") + "</blockquote>\n"
+
+    text = re.sub(r"(?:^&gt;[^\n]*(?:\n|$))+", _quote_block, text, flags=re.MULTILINE)
+    text = text.replace("</blockquote>\n\n", "</blockquote>\n")
+
     for i, code in enumerate(inline_codes):
         text = text.replace(_IC_TOKEN.format(i), f"<code>{code}</code>")
     for i, code in enumerate(code_blocks):
@@ -215,8 +357,21 @@ _HEADING_RE = re.compile(r"^#{1,6}\s+\S", re.M)          # # Заголовок
 _ORDERED_RE = re.compile(r"^\s*\d+\.\s+\S", re.M)         # 1. пункт
 _CHECKBOX_RE = re.compile(r"^\s*[\*\-\+]\s+\[[ xX]\]\s", re.M)  # - [ ] / - [x]
 _DIVIDER_RE = re.compile(r"^\s*---+\s*$", re.M)            # --- разделитель
+_URLISH_RE = re.compile(r"https?://|www\.|\b[\w-]+(\.[\w-]+)*\.(ru|com|org|net|io|me|app|dev|ai|org|рф|su|co|xyz|site|online)\b", re.I)
 _RICH_RES = (_TABLE_SEP_RE, _NESTED_LI_RE, _HEADING_RE,
              _ORDERED_RE, _CHECKBOX_RE, _DIVIDER_RE)
+
+
+# Подвал сохранения (24.09.2026): строки «> 💾 …» в самом конце ответа. На HTML-пути
+# сворачиваются в раскрывающийся блок, на rich-пути идут простой цитатой.
+SAVE_FOOTER_HEAD = "💾 сохранено"
+
+
+def _split_footer(text):
+    i = text.rfind("\n> " + SAVE_FOOTER_HEAD)
+    if i < 0 and text.startswith("> " + SAVE_FOOTER_HEAD):
+        i = 0
+    return (text, "") if i < 0 else (text[:i], text[i:].lstrip("\n"))
 
 
 def _wants_rich(text):
@@ -224,6 +379,19 @@ def _wants_rich(text):
     sendRichMessage: таблица, вложенный/нумерованный список, галочки, заголовок,
     разделитель. Обычная проза остаётся на HTML-пути."""
     if not text:
+        return False
+    # подвал сохранения rich-путь не отнимает: смотрим только тело ответа
+    text = _split_footer(text)[0]
+    # цитаты «> » нужны раскрывающимся блоком, а его умеет только HTML-путь
+    if re.search(r"^>[ \t]", text, flags=re.MULTILINE):
+        return False
+    # 14.10.2026: клиент Telegram падает при нажатии на ссылку в rich-сообщении,
+    # если текст ссылки похож на адрес (голый URL, [url](url), <url>). Проверено
+    # пробами А/Б/В: [слово](url) живёт, остальное роняет клиент. Такие ответы
+    # идут HTML-путём. Ссылки вида [слово](url) вырезаем перед проверкой.
+    if _URLISH_RE.search(re.sub(r"\[[^\]]*\]\([^)\s]+\)",
+                                lambda m: "" if not _URLISH_RE.search(m.group(0).split("](")[0]) else m.group(0),
+                                text)):
         return False
     return any(r.search(text) for r in _RICH_RES)
 
@@ -264,7 +432,7 @@ def _build_choices_markup(choices):
 
 def _strip_active_keyboard(chat_id):
     """Remove keyboard from the previously active brief message in this chat."""
-    old = _brief_active_msg.get(chat_id)
+    old = _brief_active_msg.get(ckey(chat_id))
     if not old:
         return
     try:
@@ -294,6 +462,9 @@ def send_chunked(chat_id, text, confirm=False, choices=None, dig=False, with_men
         last_rows = [[{"text": "🔎", "callback_data": "dig"}]]
     elif confirm:
         last_rows = [[{"text": "✅", "callback_data": "ok"}]]
+    # Кнопка меню отключается переключателем menu_enabled в profile.json.
+    if with_menu and not PROFILE.get("menu_enabled", True):
+        with_menu = False
     if with_menu:
         if menu_rows is None:
             last_rows.append(_MENU_ROW)
@@ -315,7 +486,11 @@ def send_chunked(chat_id, text, confirm=False, choices=None, dig=False, with_men
     # если есть статус-сообщение «думаю» — удаляем его и шлём rich свежим.
     # Сбой rich → откат на обычный HTML-путь ниже.
     if _wants_rich(text) and len(text) <= TG_CHUNK:
-        rm = json.dumps({"markdown": text}, ensure_ascii=False)
+        body, foot = _split_footer(text)
+        if foot:
+            # rich склеивает строки цитаты в одну: разводим их пустой строкой цитаты
+            foot = "\n>\n".join(foot.split("\n"))
+        rm = json.dumps({"markdown": (body.rstrip() + "\n\n" + foot) if foot else text}, ensure_ascii=False)
         res = api("sendRichMessage", chat_id=chat_id, rich_message=rm,
                   reply_markup=last_markup)
         if res.get("ok"):
@@ -327,7 +502,7 @@ def send_chunked(chat_id, text, confirm=False, choices=None, dig=False, with_men
                     pass
             mid = res.get("result", {}).get("message_id")
             if with_menu and mid is not None:
-                _brief_active_msg[chat_id] = mid
+                _brief_active_msg[ckey(chat_id)] = mid
             log("SEND-TRACE  rich message sent (table/heading/list)")
             return
         log(f"rich send failed, fallback to HTML: {res.get('description','?')[:120]}")
@@ -356,7 +531,7 @@ def send_chunked(chat_id, text, confirm=False, choices=None, dig=False, with_men
         if is_last and res.get("ok"):
             last_msg_id = res.get("result", {}).get("message_id")
     if with_menu and last_msg_id is not None:
-        _brief_active_msg[chat_id] = last_msg_id
+        _brief_active_msg[ckey(chat_id)] = last_msg_id
 
 def _oneshot(args, timeout=60):
     """Запустить tg-send-oneshot.py, вернуть распарсенный JSON (или dict с ok=False)."""

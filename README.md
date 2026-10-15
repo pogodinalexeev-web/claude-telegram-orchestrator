@@ -22,7 +22,7 @@ pool.
 
 - **One agent per chat, kept warm** — the ~6-second cold start is paid once, not on
   every message. Idle residents are reaped; the thread survives via session resume.
-- **A shared core, several owners.** 15 modules, ~6,800 lines, zero personal values
+- **A shared core, several owners.** 18 modules, ~8,900 lines, zero personal values
   inside — a new owner is a config file, not a fork. Enforced by a test that sweeps
   every module for names, home paths and chat ids.
 - **Semantic search over a personal knowledge base** in **0.1–0.8s**, locally, with
@@ -75,7 +75,7 @@ flowchart LR
 | File / folder | What it is |
 | --- | --- |
 | `bot.py` | A **minimal** orchestrator (~150 lines) — the core loop in its clearest form: long-poll, one resident per chat, stream the reply back. Start reading here. |
-| `core/` | The **production core**: 15 modules, shared by every owner on the machine. Entry point `tg-bot.py`, then `intake` → `turn` → `claude_run`. See [`core/ARCHITECTURE.md`](core/ARCHITECTURE.md). |
+| `core/` | The **production core**: 18 modules, shared by every owner on the machine. Entry point `tg-bot.py`, then `intake` → `turn` → `claude_run`. See [`core/ARCHITECTURE.md`](core/ARCHITECTURE.md). |
 | `vault_rag/` | The semantic search engine — hybrid (vector + full-text), local, GPU-free, with a warm daemon serving several vaults at once. ([how and why](docs/rag-search.md)) |
 | `deploy/` | systemd unit, the sync package, a full profile example. |
 | `docs/` | Deep dives: [search](docs/rag-search.md), [sync](docs/sync.md). |
@@ -148,6 +148,29 @@ voice, calendar, and run long jobs that report back when done.
 - **Text-to-speech**, **Google Calendar** (two-stage create), **attachments**
   (auto-save + confirm/drop), **inline menu**, **background jobs** that self-notify.
 
+### Living with the bot every day (Sep–Oct 2026)
+*Plain English:* the bot behaves like a colleague in a messenger, not a form: you can
+talk over it, run several conversations at once, see what it heard, and switch the brain.
+*Technical:*
+- **Telegram topics = parallel conversations.** Each topic in a private chat gets its own
+  resident and its own session; replies, voice, images and the menu return to the topic
+  they came from. A cap on live residents per bot keeps memory bounded.
+- **Soft follow-up.** A message sent while the bot is answering is injected into the
+  running turn instead of killing it; interrupt mode stays available per profile.
+- **Voice transcript echo.** Right after transcription the bot posts `🎙 «…»` with the full
+  text (split at the Telegram limit), so the owner sees what was heard before the answer.
+  Pattern borrowed from Hermes Agent (`stt_echo_transcripts`); switch: `voice_echo`.
+- **Engine switch: Claude or Codex.** `/codex` and `/claude` per bot; when Claude hits its
+  usage limit, the same turn is answered by Codex instead of failing.
+- **Control panel mini-app.** A Telegram Web App with engine, model and effort buttons,
+  plus meters for subscription usage and conversation fill.
+- **Live status panel.** “Thinking…” words rotate like in Claude Code, with a ⏹ STOP button.
+- **Department-bot profile switches.** Group-only behaviour (call by @mention only,
+  strict allowlist, recent-chat context, no panel/header/magnifier) is set in the profile,
+  not forked in code.
+- **Timer door.** A localhost-only `/inject` endpoint with its own key lets scheduled
+  timers land as a normal turn in the right chat.
+
 ### A capability pool
 *Plain English:* 53 ready commands — research, transcription, content generation,
 scrapers, the note funnel.
@@ -219,7 +242,7 @@ Six-core box, 12 GB RAM; vault of ~1,700 notes / 39,000 chunks.
 | Search daemon serving all owners | 0.9–1.5 GB |
 | Same, old scheme: one daemon per owner | 1.2–1.5 GB **each** |
 | Appending to a 256 KB journal | 1 chunk re-embedded, was 110 |
-| Core size | 15 modules, ~6,800 lines |
+| Core size | 18 modules, ~8,900 lines |
 
 ## Tech stack
 

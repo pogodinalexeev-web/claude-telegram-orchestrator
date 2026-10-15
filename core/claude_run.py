@@ -28,10 +28,13 @@ from botctx import (
     _INTERRUPTED_SENTINEL, _INTERRUPT_FLAGS, _RESIDENT, _RESIDENT_LOCK,
     _RESIDENT_SEEN,
     _RUNNING_PROCS, _RUNNING_PROCS_LOCK, _STOP_FLAGS, _STOP_POSTED,
-    _STOP_KEYBOARD, _STREAM_PARTIAL, _get_turn_lock,
+    _STOP_KEYBOARD, _STREAM_PARTIAL, _get_turn_lock, _FOLLOWUP_GATES,
+    carry, ckey, ckey_topic, in_topic, topic_session_name,
 )
+import engine
+import meters
 from prompt import SYSTEM_PROMPT, build_system_prompt, load_persona
-from tgapi import api, build_status_panel, strip_html, _BENIGN_API_ERRORS
+from tgapi import api, build_status_panel, strip_html, think_spin, _BENIGN_API_ERRORS
 
 # «Ничейный ход» — резидент проснулся сам (напоминалка, фоновая задача) и
 # выдал текст, которого никто не просил. Обработка такого хода живёт в turn.py,
@@ -44,6 +47,53 @@ def set_stray_handler(fn):
     """Кто разбирает ничейный ход. Ставит tg-bot.py при сборке."""
     global _stray_handler
     _stray_handler = fn
+
+
+def _stray_in_topic(chat_id, thread_id, events):
+    """Ничейный ход резидента темы: отвечаем в ту же тему."""
+    with in_topic(chat_id, thread_id):
+        _stray_handler(chat_id, chat_id, events)
+
+
+# 25.09.2026 (слово хозяина 04:29 «надо режим досылания делать»): что делать с сообщением,
+# пришедшим посреди хода. «interrupt» — старая догонка: ход рвётся, обрывок «✂️ прервано»,
+# новое сообщение отдельным ходом. «soft» — ход не рвётся, сообщение дописывается внутрь
+# него, в чат метка «➕ поправка». Выключатель — поле "followup" в settings_json хозяина
+# (у хозяина это ~/.claude/bot-model.json), по умолчанию interrupt: соседи не меняются.
+_SOFT_PREFIX = (
+    "[Хозяин дослал это по ходу твоего ответа, не дожидаясь конца. Ответ НЕ прерван: "
+    "учти досланное и продолжай с того места, где был. Уже написанное не повторяй, "
+    "дописывай только новое.]\n\n"
+)
+
+
+def _followup_mode():
+    try:
+        _settings = engine.bin_and_settings(engine.stored())[1]
+        return json.loads(Path(_settings).read_text()).get("followup") or "interrupt"
+    except Exception:
+        return "interrupt"
+
+
+def _soft_followup(chat_id, prompt_text):
+    """Дописать сообщение в идущий ход. False — резидента нет или запись не прошла,
+    тогда зовущий откатывается на старую догонку. chat_id здесь — ключ беседы (ckey)."""
+    with _RESIDENT_LOCK:
+        running = _RESIDENT.get(chat_id)
+    if running is None or not running.is_alive():
+        return False
+    # ворота до инъекции: если досланное встанет отдельным ходом, его ничейный ответ
+    # ждёт, пока в чат уйдёт ответ идущего хода, иначе продолжение обгонит начало
+    _FOLLOWUP_GATES[chat_id] = threading.Event()
+    if not running.inject(_SOFT_PREFIX + prompt_text):
+        _FOLLOWUP_GATES.pop(chat_id, None)
+        return False
+    log(f"  мягкий досыл: сообщение дописано в идущий ход на чате {chat_id}")
+    # Acknowledgement belongs to the existing streamed answer, never a new message.
+    partial = _STREAM_PARTIAL.get(chat_id)
+    if partial is not None:
+        partial.append("➕")
+    return True
 
 
 def _humanize_action(name, inp):
@@ -124,7 +174,7 @@ def pick_effort(prompt_text):
     keywords or long prompts (>600 chars)."""
     return "high"
 
-def call_claude(prompt_text, session_id=None, status_chat_id=None, bg_wait=False):
+def call_claude(prompt_text, session_id=None, status_chat_id=None, bg_wait=False, engine_name=None, chat_id=None):
     """Run headless claude with stream-json output. Logs each tool_use as it streams.
     If status_chat_id is given, posts a live status message in TG and edits it as
     tool_use events arrive (throttled to 1 edit/sec). Returns (reply_text, new_session_id, used_tokens).
@@ -171,24 +221,21 @@ def call_claude(prompt_text, session_id=None, status_chat_id=None, bg_wait=False
     # механизм лежал недостижимым балластом. Поток идёт через editMessageText в панель
     # (ветка `streamed_text` в update_status), прерывание держит кнопка ⏹СТОП.
     # Разбор — журнал/2026-07-06 стрим черновика — блокировка доставки на Android.md
-    if status_chat_id:
-        _STREAM_PARTIAL[status_chat_id] = streamed_text  # для callback ⏹СТОП
     # chunk_flushed остаётся [0] навсегда — ветки заморозки/стопа/финала ниже читают
     # [chunk_flushed[0]:] = весь накопленный текст.
     chunk_flushed = [0]
     # Публикуем «принял, думаю…» со ⏹ СТОП сразу, ещё до старта claude -p,
     # чтобы хозяин мог нажать СТОП прямо в момент когда понял «не туда пошёл».
-    if status_chat_id:
-        try:
-            r = api("sendMessage", chat_id=status_chat_id,
-                    text="⏳ принял, думаю…",
-                    parse_mode="HTML", reply_markup=_STOP_KEYBOARD)
-            if r.get("ok"):
-                status_msg_id[0] = r["result"]["message_id"]
-        except Exception as e:
-            log(f"early-status post failed: {e}")
+    # 24.09.2026: status_panel=False (бот отдела) — панели нет совсем: ни «думаю…», ни ⏹СТОП,
+    # ни потока правками. status_chat_id при этом живёт: замок хода, резидент и догонка работают.
+    # 24.09.2026 16:15: status_panel="compact" (бот отдела, слово хозяина) — панель и ⏹СТОП есть,
+    # но в ней только «думаю… (время)», текущий шаг и свёрнутый список вызовов; поток текста и
+    # рассуждение не показываются, ответ приходит одним куском правкой той же панели.
+    _panel_mode = PROFILE.get("status_panel", True)
+    _show_panel = bool(_panel_mode)
+    _compact = _panel_mode == "compact"
     def update_status(force=False):
-        if not status_chat_id or (not status_lines and not streamed_text):
+        if not status_chat_id or not _show_panel or (not status_lines and (_compact or not streamed_text)):
             return
         elapsed = int(time.time() - t_start)
         m, s = divmod(elapsed, 60)
@@ -197,7 +244,8 @@ def call_claude(prompt_text, session_id=None, status_chat_id=None, bg_wait=False
         # "думаю…" и поток текста модели — снаружи, видны сразу.
         hourglass = "⏳" if elapsed % 2 == 0 else "⌛"
         text = build_status_panel(hourglass, elapsed_str, current_action[0],
-                                  thinking_text, status_lines, streamed_text)
+                                  [] if _compact else thinking_text, status_lines,
+                                  [] if _compact else streamed_text)
         now = time.time()
         # 2026-06-17: throttle 5.0 → 1.5с. На 5.0 текст и рассуждение прыгали раз в 5с —
         # выглядело как зависание. Telegram editMessageText держит ~1/сек/чат на один
@@ -238,18 +286,33 @@ def call_claude(prompt_text, session_id=None, status_chat_id=None, bg_wait=False
     # когда прошлый ход умер по СТОП и резидента надо пересоздать.
     turn_lock = None
     did_interrupt = False
-    if status_chat_id is not None:
-        turn_lock = _get_turn_lock(status_chat_id)
+    # 08.10.2026: ключ беседы. Без темы это status_chat_id, как было; в теме
+    # (chat_id, тема): у каждой темы свой замок, резидент, СТОП и досыл.
+    # 09.10.2026 (слово хозяина 12:40: «не должно быть бесхозных бесед, всё к чему-то
+    # привязано»): резидент привязан к беседе, даже если панели нет. Раньше в группе
+    # без панели (status_chat_id=None) ключа не было: каждый ход поднимал новый
+    # `claude` и бросал его живым. Штурм с соседним ботом в общей группе оставил 17
+    # процессов по ~230 МБ, подкачка встала. chat_id даёт ключ без панели.
+    _key_chat = status_chat_id if status_chat_id is not None else chat_id
+    ck = ckey(_key_chat) if _key_chat is not None else None
+    if ck is not None:
+        turn_lock = _get_turn_lock(ck)
         if not turn_lock.acquire(blocking=False):
-            if bg_wait:
+            if bg_wait or status_chat_id is None:
+                # Беседа без панели (группа): прерывать нечем и некому показать
+                # обрывок, ход ждёт свою очередь, как ждал бы фон.
                 # 2026-06-19: фоновый ход (сторож за процессом) — НЕ прерывает живой
                 # диалог хозяина, а вежливо ждёт замок. Хозяин главнее сторожа.
                 log(f"  bg-ход ждёт замок на чате {status_chat_id} (не прерываю)")
                 turn_lock.acquire()
+            elif _followup_mode() == "soft" and _soft_followup(ck, prompt_text):
+                # 25.09.2026 (слово хозяина 04:29): мягкий досыл. Идущий ход не прерываем,
+                # досланное уже внутри него; своего хода у этого сообщения нет.
+                return (_INTERRUPTED_SENTINEL, session_id, 0, 0, None)
             else:
-                _INTERRUPT_FLAGS[status_chat_id] = True
+                _INTERRUPT_FLAGS[ck] = True
                 with _RESIDENT_LOCK:
-                    running = _RESIDENT.get(status_chat_id)
+                    running = _RESIDENT.get(ck)
                 _dogonka_freed = threading.Event()
                 if running is not None:
                     log(f"  догонка: прерываю текущий ход на чате {status_chat_id}")
@@ -273,6 +336,19 @@ def call_claude(prompt_text, session_id=None, status_chat_id=None, bg_wait=False
                 turn_lock.acquire()  # ждём, пока прерванный ход освободит замок
                 _dogonka_freed.set()
                 did_interrupt = True
+    # Only the owner of the turn may publish a panel or replace the STOP buffer.
+    if status_chat_id:
+        _STREAM_PARTIAL[ck] = streamed_text  # для callback ⏹СТОП
+    if status_chat_id and _show_panel:
+        try:
+            r = api("sendMessage", chat_id=status_chat_id,
+                    text=f"{think_spin('0с')} принял, думаю…",
+                    parse_mode="HTML", reply_markup=_STOP_KEYBOARD)
+            if r.get("ok"):
+                status_msg_id[0] = r["result"]["message_id"]
+        except Exception as e:
+            log(f"early-status post failed: {e}")
+
     if did_interrupt:
         prompt_text = (
             "[Хозяин прервал твой предыдущий ответ и сразу дослал это сообщение. "
@@ -285,17 +361,42 @@ def call_claude(prompt_text, session_id=None, status_chat_id=None, bg_wait=False
         """Единая точка выбора модели/усилия — settings.json хозяина (поле профиля).
         2026-07-02 (по просьбе хозяина): не хардкодить модель в коде — менять в одном месте."""
         try:
-            cfg = json.loads(Path(PROFILE["settings_json"]).read_text())
+            cfg = json.loads(Path(run_settings).read_text())
             return (cfg.get("model") or "claude-opus-4-8[1m]",
                     cfg.get("effort") or "medium")
         except Exception:
             return ("claude-opus-4-8[1m]", "medium")
 
+    # 08.10.2026: движок хода (Клод или Кодекс через переходник), см. engine.py
+    engine_name = engine_name or engine.current()
+    run_bin, run_settings = engine.bin_and_settings(engine_name)
     # Получаем живой ResidentClaude для этого чата или создаём.
     rc = None
-    if status_chat_id is not None:
+    if ck is not None:
         with _RESIDENT_LOCK:
-            existing = _RESIDENT.get(status_chat_id)
+            existing = _RESIDENT.get(ck)
+            # 08.10.2026: движок сменился — живой процесс другого движка гасим,
+            # новый поднимется ниже со своей беседой (sid из своего файла бесед).
+            if existing is not None and getattr(existing, "engine", "claude") != engine_name:
+                _RESIDENT.pop(ck, None)
+                try:
+                    existing.kill()
+                except Exception as e:
+                    log(f"  engine switch: resident kill err: {e}")
+                existing = None
+            # 08.10.2026: пульт (pult.py) сменил модель или усилие — живой резидент
+            # поднят со старыми флагами. Ход ещё не начат, гасим его, новый поднимется
+            # ниже с той же беседой (resume) и новыми флагами.
+            if existing is not None and existing.is_alive() and \
+                    (getattr(existing, "model", None), getattr(existing, "effort", None)) != _settings_model():
+                _RESIDENT.pop(ck, None)
+                log(f"  pult: модель/усилие сменились ({existing.model}/{existing.effort} → "
+                    f"{'/'.join(_settings_model())}), резидент поднимается заново")
+                try:
+                    existing.kill()
+                except Exception as e:
+                    log(f"  pult: resident kill err: {e}")
+                existing = None
             if existing is not None and existing.is_alive():
                 rc = existing
     if rc is None:
@@ -304,8 +405,16 @@ def call_claude(prompt_text, session_id=None, status_chat_id=None, bg_wait=False
             # Личность перечитывается при КАЖДОМ создании резидента: хозяин
             # поправил Self/tg-persona.md, сказал /new — получил новый тон,
             # рестарт юнита не нужен.
+            # 08.10.2026: резидент темы подписан: в списке бесед Claude Code он
+            # «TG: <название темы>», а таймер, поставленный из темы, знает, куда
+            # вернуться (BOT_CHAT_ID/BOT_THREAD_ID читает tools/bot-timer.py).
+            _topic_kw = {}
+            _tid = ckey_topic(ck) if ck is not None else None
+            if _tid:
+                env_extra = {**env_extra, "BOT_CHAT_ID": str(_key_chat), "BOT_THREAD_ID": str(_tid)}
+                _topic_kw["name"] = topic_session_name(_key_chat, _tid)
             rc = ResidentClaude(
-                claude_bin=CLAUDE_BIN,
+                claude_bin=run_bin,
                 system_prompt=build_system_prompt(PROFILE, load_persona(PROFILE, log=log)),
                 model=_model,
                 effort=_effort,
@@ -314,7 +423,9 @@ def call_claude(prompt_text, session_id=None, status_chat_id=None, bg_wait=False
                 env_extra=env_extra,
                 disallowed_tools=DISALLOWED,
                 permission_mode="bypassPermissions",
+                **_topic_kw,
             )
+            rc.engine = engine_name
             rc.start()
         except Exception as e:
             if turn_lock is not None:
@@ -323,20 +434,23 @@ def call_claude(prompt_text, session_id=None, status_chat_id=None, bg_wait=False
                 except RuntimeError:
                     pass
             return (f"⚠️ Ошибка запуска claude: {e}", session_id, 0, 0, status_msg_id[0])
-        if status_chat_id is not None:
+        if ck is not None:
             with _RESIDENT_LOCK:
-                _RESIDENT[status_chat_id] = rc
+                _RESIDENT[ck] = rc
+            _RESIDENT_SEEN[ck] = time.time()
+            _enforce_resident_cap(keep=ck)
 
     # 2026-07-02: ничейные ходы (будильники агентов) — в чат сразу, не в трубу.
-    if status_chat_id is not None:
-        _sc = status_chat_id
-        rc.on_stray = lambda events, _c=_sc: _stray_handler(_c, _c, events)
+    if ck is not None:
+        _sc = _key_chat
+        # читатель резидента — чужой поток: тему беседы закрепляем явно
+        rc.on_stray = lambda events, _c=_sc, _t=ckey_topic(ck): _stray_in_topic(_c, _t, events)
 
     # Регистрируем underlying Popen для кнопки ⏹ СТОП (handle_callback делает proc.kill()).
     proc = rc.proc
     if status_chat_id:
         with _RUNNING_PROCS_LOCK:
-            _RUNNING_PROCS[status_chat_id] = proc
+            _RUNNING_PROCS[ck] = proc
 
     t_start = time.time()
     timed_out = False
@@ -351,7 +465,7 @@ def call_claude(prompt_text, session_id=None, status_chat_id=None, bg_wait=False
                 update_status(force=True)
             except Exception:
                 pass
-    _ticker_thread = threading.Thread(target=_ticker, daemon=True)
+    _ticker_thread = threading.Thread(target=carry(_ticker), daemon=True)
     _ticker_thread.start()
     try:
         for ev in rc.send_and_collect(prompt_text, turn_timeout=CLAUDE_TIMEOUT):
@@ -360,6 +474,10 @@ def call_claude(prompt_text, session_id=None, status_chat_id=None, bg_wait=False
                 rc.kill()
                 break
             etype = ev.get("type")
+            if etype == "rate_limit_event":
+                # 08.10.2026: остаток подписки для полоски в пульте (meters.py)
+                meters.note_claude_limits(ev.get("rate_limit_info"))
+                continue
             # 2026-06-04: дельты текста — приоритетная ветка. С --include-partial-messages
                 # CLI шлёт content_block_delta каждые ~300-500мс, по 30-100 символов.
                 # Это и есть «слова текут», как в Claude Code десктопе.
@@ -389,7 +507,13 @@ def call_claude(prompt_text, session_id=None, status_chat_id=None, bg_wait=False
                                 log(f"  first-event after {first_event_at:.1f}s (thinking)")
                             thinking_text.append(th)
                             update_status()
-                # message_start / content_block_start / content_block_stop / message_stop /
+                # 2026-09-23: новое сообщение модели в том же ходе (ответ после крюка
+                # сохранения) прежде приклеивалось к предыдущему без разрыва, и маркер
+                # вида __BG_TASK__: {...} переставал распознаваться: разборщик ждёт }
+                # в конце строки, а получал "}·". Ставим разрыв между сообщениями.
+                if ev_type == "message_start":
+                    pending_sep[0] = True
+                # content_block_start / content_block_stop / message_stop /
                 # signature_delta — UI не нужны, игнорируем.
                 continue
             if etype == "assistant" and first_event_at is None:
@@ -445,6 +569,11 @@ def call_claude(prompt_text, session_id=None, status_chat_id=None, bg_wait=False
                 ctx_tokens = (last_it.get("cache_creation_input_tokens") or 0) + (last_it.get("cache_read_input_tokens") or 0) + (last_it.get("input_tokens") or 0)
                 cache_creation = sum((it.get("cache_creation_input_tokens") or 0) for it in its)
                 cache_read = sum((it.get("cache_read_input_tokens") or 0) for it in its)
+                # 08.10.2026: заполнение беседы для пульта; окно модели отдаёт сам Клод
+                _win = max([int((mu or {}).get("contextWindow") or 0)
+                            for mu in (ev.get("modelUsage") or {}).values()] or [0])
+                meters.note_context(status_chat_id, engine_name,
+                                    ctx_tokens or (u.get("input_tokens") or 0), _win)
     except TimeoutError:
         timed_out = True
         rc.kill()
@@ -460,21 +589,25 @@ def call_claude(prompt_text, session_id=None, status_chat_id=None, bg_wait=False
         _ticker_stop.set()
         if status_chat_id:
             with _RUNNING_PROCS_LOCK:
-                if _RUNNING_PROCS.get(status_chat_id) is proc:
-                    _RUNNING_PROCS.pop(status_chat_id, None)
+                if _RUNNING_PROCS.get(ck) is proc:
+                    _RUNNING_PROCS.pop(ck, None)
         # Если процесс мёртв (СТОП, timeout, краш) — выкинем из _RESIDENT,
         # следующий ход поднимет новый с --resume последнего sid.
         # 2026-08-27: тут же отметка времени для жнеца — «в этом чате был ход
         # вот когда». Мёртвого убираем и из отметок, чтобы словарь не копил
         # чаты, которых давно нет.
-        if status_chat_id is not None:
+        if ck is None:
+            # Ход без беседы (разовый вызов, напр. передача при /compact):
+            # процесс одноразовый, закрываем сразу, бесхозным он не остаётся.
+            threading.Thread(target=rc.close, daemon=True).start()
+        else:
             if rc.is_alive():
-                _RESIDENT_SEEN[status_chat_id] = time.time()
+                _RESIDENT_SEEN[ck] = time.time()
             else:
                 with _RESIDENT_LOCK:
-                    if _RESIDENT.get(status_chat_id) is rc:
-                        _RESIDENT.pop(status_chat_id, None)
-                _RESIDENT_SEEN.pop(status_chat_id, None)
+                    if _RESIDENT.get(ck) is rc:
+                        _RESIDENT.pop(ck, None)
+                _RESIDENT_SEEN.pop(ck, None)
         if turn_lock is not None:
             try:
                 turn_lock.release()
@@ -485,7 +618,7 @@ def call_claude(prompt_text, session_id=None, status_chat_id=None, bg_wait=False
     # «(пусто)» в чат, удаляем его «думаю…» (у догонки своё), отдаём sentinel.
     # pop() в условии всегда снимает флаг; подавляем ТОЛЬКО при is_error
     # (если ход успел доехать до настоящего ответа за миг до interrupt — отдаём его).
-    if status_chat_id and _INTERRUPT_FLAGS.pop(status_chat_id, False) and result_is_error:
+    if status_chat_id and _INTERRUPT_FLAGS.pop(ck, False) and result_is_error:
         # 2026-07-05 (по просьбе хозяина): прерванный ответ БОЛЬШЕ НЕ выбрасываем. Замораживаем
         # на месте, где прерывание настигло, и оставляем в чате обрывком.
         # Новое (догоняющее) сообщение отвечается отдельным ходом.
@@ -508,11 +641,11 @@ def call_claude(prompt_text, session_id=None, status_chat_id=None, bg_wait=False
         return (_INTERRUPTED_SENTINEL, new_sid or session_id, 0, 0, status_msg_id[0])
 
     # Если юзер нажал ⏹ СТОП — proc убит. Возвращаем то, что успело накопиться.
-    if status_chat_id and _STOP_FLAGS.pop(status_chat_id, False):
-        _STREAM_PARTIAL.pop(status_chat_id, None)
+    if status_chat_id and _STOP_FLAGS.pop(ck, False):
+        _STREAM_PARTIAL.pop(ck, None)
         # 2026-07-06 (по просьбе хозяина): финал по СТОП уже отправлен реальным сообщением из
         # handle_callback → не дублируем. Убираем панель «думаю…⏹» и отдаём sentinel.
-        if _STOP_POSTED.pop(status_chat_id, False):
+        if _STOP_POSTED.pop(ck, False):
             if status_msg_id[0] is not None:
                 try:
                     api("deleteMessage", chat_id=status_chat_id, message_id=status_msg_id[0])
@@ -623,6 +756,52 @@ def _reap_idle_residents(idle_sec, now=None):
         finally:
             lock.release()
     return reaped
+
+
+# ---------------------------------------------------------------------------
+# Потолок живых резидентов (08.10.2026, темы). С темами живых бесед у бота может
+# быть сколько угодно, а каждая держит свой `claude` на 270–350 МБ. Потолок из
+# профиля (max_residents, по умолчанию 4): новый резидент сверх него выселяет
+# самого давно молчащего. Занятых (идёт ход) не трогаем. Беседа не теряется:
+# sid лежит в sessions.json, следующий ход в той теме поднимет --resume.
+
+def _max_residents():
+    try:
+        return int(PROFILE.get("max_residents", 4) or 0)
+    except (TypeError, ValueError):
+        return 4
+
+
+def _enforce_resident_cap(keep=None, cap=None):
+    """Выселить лишних живых резидентов по давности. Возвращает список ключей."""
+    cap = _max_residents() if cap is None else cap
+    if cap <= 0:
+        return []
+    with _RESIDENT_LOCK:
+        alive = [k for k, rc in _RESIDENT.items() if rc.is_alive()]
+    excess = len(alive) - cap
+    if excess <= 0:
+        return []
+    order = sorted((k for k in alive if k != keep), key=lambda k: _RESIDENT_SEEN.get(k, 0))
+    evicted = []
+    for k in order:
+        if len(evicted) >= excess:
+            break
+        lock = _get_turn_lock(k)
+        if not lock.acquire(blocking=False):
+            continue            # там идёт ход — не трогаем
+        try:
+            with _RESIDENT_LOCK:
+                rc = _RESIDENT.pop(k, None)
+            _RESIDENT_SEEN.pop(k, None)
+        finally:
+            lock.release()
+        if rc is None:
+            continue
+        threading.Thread(target=rc.close, daemon=True).start()
+        evicted.append(k)
+        log(f"потолок резидентов ({cap}): закрыт резидент беседы {k}, следующий ход поднимет его с --resume")
+    return evicted
 
 
 def start_resident_reaper(idle_sec=None, period_sec=RESIDENT_REAP_PERIOD_SEC):

@@ -13,18 +13,22 @@
 потому что отметка сессии хранит отпечаток хранилища: правила поменялись —
 живой сессии доносится разница, а не перезапуск.
 """
+import contextlib
+import fcntl
 import json
 import os
 import socket
 import subprocess
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
 
 from botctx import (
-    ALLOW_FILE, DO_QUEUE, INBOX, MANIFEST_DIR, MSK, OFFSET_FILE, PROFILE,
-    SESSIONS_FILE, TASKS_FILE, VAULT, log,
+    CACHE_DIR, ALLOW_FILE, DO_QUEUE, INBOX, MANIFEST_DIR, MSK, OFFSET_FILE, PROFILE,
+    SESSIONS_FILE, TASKS_FILE, TOPICS_FILE, VAULT, log,
 )
+import engine
 
 
 def load_allowlist():
@@ -68,8 +72,9 @@ def save_offset(o):
 
 
 def load_sessions():
+    # 08.10.2026: у Клода и Кодекса беседы раздельные, файл выбирает engine.py
     try:
-        return json.loads(SESSIONS_FILE.read_text())
+        return json.loads(engine.sessions_file().read_text())
     except FileNotFoundError:
         return {}
     except Exception:
@@ -77,7 +82,17 @@ def load_sessions():
 
 
 def save_sessions(s):
-    SESSIONS_FILE.write_text(json.dumps(s, indent=2))
+    # 08.10.2026, темы: запись атомарная. Две темы кончают ход разом, и читатель,
+    # попавший на полузаписанный файл, получал {} — следующая запись стирала все беседы.
+    f = engine.sessions_file()
+    tmp = f.with_name(f".{f.name}.{threading.get_ident()}.tmp")
+    tmp.write_text(json.dumps(s, indent=2))
+    tmp.replace(f)
+
+
+# Чтение-правка-запись файла бесед — под одним замком процесса: иначе ход одной
+# темы затирает только что записанную сессию соседней.
+_SESSIONS_LOCK = threading.RLock()
 
 
 def get_session(uid):
@@ -117,36 +132,38 @@ def significant_diff(old_head, new_head):
 
 def update_vault_head(uid):
     """Stamp current vault HEAD onto user's session. Call after git_sync settles."""
-    head = vault_head()
-    if not head:
-        return
-    s = load_sessions()
-    rec = s.get(str(uid))
-    if not rec:
-        return
-    rec["vault_head"] = head
-    s[str(uid)] = rec
-    save_sessions(s)
+    with _SESSIONS_LOCK:
+        head = vault_head()
+        if not head:
+            return
+        s = load_sessions()
+        rec = s.get(str(uid))
+        if not rec:
+            return
+        rec["vault_head"] = head
+        s[str(uid)] = rec
+        save_sessions(s)
 
 
 def set_session(uid, sid, msg_count=None, add_tokens=0):
-    s = load_sessions()
-    rec = s.get(str(uid), {})
-    if msg_count is None:
-        if sid == rec.get("session_id"):
-            msg_count = rec.get("msg_count", 0) + 1
-        else:
-            msg_count = 1
-    rec["session_id"] = sid
-    rec["last_ts"] = time.time()
-    rec["msg_count"] = msg_count
-    if msg_count == 1:
-        rec.pop("warned_high", None)
-        rec.pop("warned_urgent", None)
-        rec["total_tokens"] = 0  # новая сессия — счётчик с нуля
-    rec["total_tokens"] = rec.get("total_tokens", 0) + (add_tokens or 0)
-    s[str(uid)] = rec
-    save_sessions(s)
+    with _SESSIONS_LOCK:
+        s = load_sessions()
+        rec = s.get(str(uid), {})
+        if msg_count is None:
+            if sid == rec.get("session_id"):
+                msg_count = rec.get("msg_count", 0) + 1
+            else:
+                msg_count = 1
+        rec["session_id"] = sid
+        rec["last_ts"] = time.time()
+        rec["msg_count"] = msg_count
+        if msg_count == 1:
+            rec.pop("warned_high", None)
+            rec.pop("warned_urgent", None)
+            rec["total_tokens"] = 0  # новая сессия — счётчик с нуля
+        rec["total_tokens"] = rec.get("total_tokens", 0) + (add_tokens or 0)
+        s[str(uid)] = rec
+        save_sessions(s)
 
 
 def get_msg_count(uid):
@@ -160,9 +177,10 @@ def get_total_tokens(uid):
 
 
 def reset_session(uid):
-    s = load_sessions()
-    s.pop(str(uid), None)
-    save_sessions(s)
+    with _SESSIONS_LOCK:
+        s = load_sessions()
+        s.pop(str(uid), None)
+        save_sessions(s)
 
 
 COMPACT_FIRST_AT = 15  # first compact reminder at this msg count
@@ -187,7 +205,7 @@ def safe_vault_path(rel_path):
 
 def _persona_dir():
     """Папка с файлом личности — в относительном виде, с косой чертой на конце.
-    У каждого хозяина она своя (поле profile.persona_path), раньше хозяйская
+    У каждого хозяина она своя (поле profile.persona_path), раньше общая
     лежала здесь литералом. Файл вне хранилища — папки в списке просто не будет."""
     try:
         rel = Path(PROFILE["persona_path"]).parent.relative_to(VAULT)
@@ -236,8 +254,33 @@ def route_to_do_queue(text):
     git_sync(f"do-queue: {text.strip()[:50]}")
 
 
+# 08.10.2026, темы: два хода в двух темах кончаются почти одновременно, и два
+# `git add/commit/merge` в одной рабочей копии дают index.lock и недоделанное
+# слияние. Весь git хода (подтягивание перед ходом и git_sync после) идёт под
+# одним файловым замком в кэше бота: flock держится на открытом файле, поэтому
+# разводит и потоки этого процесса, и соседний процесс того же хозяина.
+GIT_LOCK_FILE = CACHE_DIR / "git.lock"
+
+
+@contextlib.contextmanager
+def vault_git_lock():
+    with open(GIT_LOCK_FILE, "a+") as f:
+        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+
+
 def git_sync(summary):
     """Stage, commit, sync, push. Robust to auto-commit hooks pre-committing."""
+    if not PROFILE.feature("git_sync"):
+        return
+    with vault_git_lock():
+        _git_sync_locked(summary)
+
+
+def _git_sync_locked(summary):
     # выключатель профиля: у бота без vault.git синхронизировать нечего, и каждый
     # ход в журнал сыпалось «not a git repository» (поймано канарейкой 19.08)
     if not PROFILE.feature("git_sync"):
@@ -378,8 +421,11 @@ def append_chatlog():
     if not PROFILE.feature("chatlog"):
         return
     try:
+        # 08.10.2026, темы: карта «тема → её сессии и название» (botctx.TOPICS_FILE).
+        # Скрипт лога, который её знает, подписывает реплики темой; старый не замечает.
         subprocess.run(["/usr/bin/python3", PROFILE["chatlog_script"]],
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30,
+                       env={**os.environ, "CHATLOG_TOPICS": str(TOPICS_FILE)})
     except Exception as e:
         log(f"  chatlog append err: {e}")
 
@@ -388,12 +434,17 @@ def rag_reindex():
     """Досборка поискового индекса сразу после синхронизации.
 
     К этому моменту на диске уже и свои правки, и подтянутое с ноута — поиск
-    будет мгновенным, а не станет ждать пересборку пачкой."""
+    будет мгновенным, а не станет ждать пересборку пачкой.
+
+    27.08.2026: дежурный подтверждает заявку мгновенно и досбирает в фоне,
+    поэтому здесь мы больше НЕ ждём саму досборку. Раньше стояли до 120с
+    ровно между <ответ готов> и <ответ улетел>: 9.7с на холостом ходу,
+    103с после выгрузки модели. Таймаут теперь только на рукопожатие."""
     if not PROFILE.feature("rag"):
         return
     try:
         rs = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        rs.settimeout(120)
+        rs.settimeout(10)   # только рукопожатие: досборка ушла в фон (27.08.2026)
         rs.connect(PROFILE["rag_sock"])
         rs.sendall(json.dumps({"cmd": "reindex"}).encode())
         rs.recv(4096)
